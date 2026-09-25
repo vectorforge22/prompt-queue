@@ -79,3 +79,11 @@ in `tui_gateway/` + `apps/desktop/src/sdk` source).
 ## License
 
 [MIT](./LICENSE)
+
+## Listing (AtlasOmnia community-plugins)
+
+```
+| [Prompt Queue](https://github.com/vectorforge22/prompt-queue) | Kanban-style prompt queue: Play drains cards one at a time, each into a new sidebar session, gated on background-review completion | [@vectorforge22](https://github.com/vectorforge22) |
+```
+
+Suggested category: **Tasks & Notes** (or Collaboration & Workflow).
