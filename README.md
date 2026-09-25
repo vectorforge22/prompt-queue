@@ -25,6 +25,12 @@ slot — while keeping every session visible in the normal sidebar.
 - **Slot hygiene** — after a card's turn, its one-shot session's
   active-session slot is released (`session.close`; the sidebar row stays), so a
   long queue can't exhaust the session cap.
+- **Card targets** — each card can run into a **new session** (default) or
+  an **existing session**: pick from the latest 10 sessions with a reply, or
+  paste a session ID. Set at add time or per-card (`🎯 target ▾`); a queued
+  card can be repointed before it fires. Target cards attach via
+  `session.resume` and are **never closed** by the plugin (the idle reaper
+  frees their slot, as with any session you use).
 - **Restart-safe** — queue state persists via plugin storage; a card running
   across an app restart is re-attached (or re-queued, never dropped).
 - **`::enqueue{prompt="…"}` transcript directive** — a chat turn can add a card
@@ -58,7 +64,8 @@ Renderer-only disk plugin (single ESM `plugin.js`, no build step):
 ## Requirements
 
 A desktop build recent enough for: `host.request` gateway RPCs
-(`session.create`, `prompt.submit`, `session.close`),
+(`session.create`, `session.list`, `session.resume`, `prompt.submit`,
+`session.close`, `session.active_list`), `host.openSession`,
 `host.onEvent('message.complete')`, `host.state.busyBySession`, `host.logs`,
 `ctx.storage`, pane contributions with `dock`, and `TRANSCRIPT_DIRECTIVE_AREA`.
 Developed and verified against the 2026-09 build (all of the above confirmed
@@ -66,8 +73,9 @@ in `tui_gateway/` + `apps/desktop/src/sdk` source).
 
 ## Known limitations
 
-- The engine never submits into a mid-turn session (one card at a time), but a
-  card whose turn stalls >1 h fails with the session left running rather than
+- The engine never submits into a mid-turn session (one card at a time — the
+  global gate also holds target cards whose session is mid-turn), but a card
+  whose turn stalls >1 h fails with the session left running rather than
   force-closing it.
 - Reorder only applies to non-live cards (a live card is mid-flight).
 - The review gate is global (one review can run app-wide), matching the

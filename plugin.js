@@ -191,6 +191,34 @@ function waitForModelFree() {
   })
 }
 
+// ── C1: card targets (new session OR an existing session) ──────────────────
+// session.list (same RPC the sidebar uses) → rows {id, title, preview,
+// started_at, message_count}. "With a reply" = message_count >= 2.
+let sessionCache = { at: 0, list: [] }
+const SESSION_LIST_REFRESH_MS = 30000
+const SESSION_LIST_LIMIT = 30 // over-fetch; the picker shows the latest 10
+const PICKER_SHOW = 10
+
+async function refreshSessionList(force) {
+  const now = Date.now()
+  if (!force && sessionCache.list.length && now - sessionCache.at < SESSION_LIST_REFRESH_MS) {
+    return sessionCache.list
+  }
+  try {
+    const res = await host.request('session.list', { limit: SESSION_LIST_LIMIT })
+    const rows = (res && res.sessions) || []
+    const list = rows
+      .filter((r) => (r.message_count || 0) >= 2)
+      .map((r) => ({ id: r.id, title: (r.title || '').trim() || r.id, last: r.started_at || 0 }))
+      .sort((a, b) => b.last - a.last)
+    sessionCache = { at: now, list }
+  } catch {
+    /* keep the stale cache (or empty) — fail-open */
+  }
+  return sessionCache.list
+}
+function pickerSessions() { return sessionCache.list.slice(0, PICKER_SHOW) }
+
 // ── engine ──────────────────────────────────────────────────────────────────
 let inFlight = 0
 const turnTimers = new Map()   // card id → { interval, timeout }
@@ -235,7 +263,7 @@ async function runCard(id) {
   const c = card(id)
   if (!c) return
 
-  // 1 — create the real session
+  // 1 — attach to the target: a NEW session, or an EXISTING one (C1).
   // Final pre-launch check: the global gate again, so a review that forked
   // after the per-card spawn grace closed still holds the next card.
   const pre = await anySessionWorking()
@@ -244,18 +272,43 @@ async function runCard(id) {
     if (v2 === 'paused') return
   }
   patchCard(id, { status: 'launching', ts: Date.now(), err: null })
-  let created
-  try {
-    created = await host.request('session.create', { title: c.title })
-  } catch (e) {
-    patchCard(id, { status: 'failed', err: 'session.create: ' + errMsg(e), ts: Date.now() })
-    return
-  }
-  const sid = created && (created.session_id || created.sessionId)
-  const stored = created && (created.stored_session_id || created.storedSessionId)
-  if (!sid) {
-    patchCard(id, { status: 'failed', err: 'session.create returned no id', ts: Date.now() })
-    return
+  const isNew = !c.target || c.target === 'new'
+  let sid
+  let stored
+  if (isNew) {
+    let created
+    try {
+      created = await host.request('session.create', { title: c.title })
+    } catch (e) {
+      patchCard(id, { status: 'failed', err: 'session.create: ' + errMsg(e), ts: Date.now() })
+      return
+    }
+    sid = created && (created.session_id || created.sessionId)
+    stored = created && (created.stored_session_id || created.storedSessionId)
+    if (!sid) {
+      patchCard(id, { status: 'failed', err: 'session.create returned no id', ts: Date.now() })
+      return
+    }
+  } else {
+    // C1: follow-up into an existing session (target = its session key; the
+    // session.list row `id` IS the key). session.resume reattaches an
+    // already-live session WITHOUT taking the slot from clients already
+    // streaming it (gateway: _resume_reuse_live attaches alongside), so a
+    // target open in a tile is safe. RPC param name: session_id (the gateway
+    // treats it as the key/target, verified in methods_session.py).
+    let resumed
+    try {
+      resumed = await host.request('session.resume', { session_id: c.target })
+    } catch (e) {
+      patchCard(id, { status: 'failed', err: 'session.resume: ' + errMsg(e), ts: Date.now() })
+      return
+    }
+    sid = resumed && (resumed.session_id || resumed.sessionId)
+    stored = c.target
+    if (!sid) {
+      patchCard(id, { status: 'failed', err: 'session.resume returned no id', ts: Date.now() })
+      return
+    }
   }
   patchCard(id, { sid, stored, status: 'running', ts: Date.now() })
 
@@ -264,7 +317,7 @@ async function runCard(id) {
     await submitWithRetry(sid, c.text)
   } catch (e) {
     patchCard(id, { status: 'failed', err: 'prompt.submit: ' + errMsg(e), ts: Date.now() })
-    host.request('session.close', { session_id: sid }).catch(() => {})
+    if (isNew) host.request('session.close', { session_id: sid }).catch(() => {}) // never close a target session
     return
   }
 
@@ -283,11 +336,15 @@ async function runCard(id) {
   const cur2 = card(id)
   if (!cur2 || cur2.status === 'failed') return
 
-  // 5 — done + free the active-session slot (the sidebar row stays)
+  // 5 — done. Free the active-session slot for sessions THIS queue created
+  // (the sidebar row stays). Target sessions are never closed by the plugin
+  // — the normal idle reaper frees their slot.
   patchCard(id, { status: 'done', doneAt: Date.now(), ts: Date.now() })
-  setTimeout(() => {
-    host.request('session.close', { session_id: sid }).catch(() => {})
-  }, CLOSE_AFTER_DONE_MS)
+  if (isNew) {
+    setTimeout(() => {
+      host.request('session.close', { session_id: sid }).catch(() => {})
+    }, CLOSE_AFTER_DONE_MS)
+  }
 }
 
 // Resolves true when the turn completed (event or busy=false watchdog),
@@ -351,10 +408,15 @@ function play() {
   }
 }
 function pause() { set({ playing: false }) }
-function addCard(text) {
+function addCard(text, target, targetTitle) {
   const t = (text || '').trim()
   if (!t) return
-  set({ cards: [...state.cards, { id: uid(), text: t, title: sanitizeTitle(t), status: 'queued', ts: Date.now() }] })
+  set({
+    cards: [...state.cards, {
+      id: uid(), text: t, title: sanitizeTitle(t), status: 'queued', ts: Date.now(),
+      target: target || 'new', targetTitle: targetTitle || null,
+    }],
+  })
 }
 function removeCard(id) {
   const c = card(id)
@@ -364,7 +426,8 @@ function removeCard(id) {
 }
 function clearDone() { set({ cards: state.cards.filter((c) => c.status !== 'done') }) }
 function openCardSession(c) {
-  if (c.stored) host.openSession(c.stored).catch(() => {})
+  const key = c.stored || c.target
+  if (key && key !== 'new') host.openSession(key).catch(() => {})
 }
 function retryCard(id) {
   patchCard(id, { status: 'queued', err: null, sid: null, stored: null, ts: Date.now() })
@@ -473,6 +536,126 @@ function StatusDot({ status }) {
   })
 }
 
+// ── C1 UI: target picker ────────────────────────────────────────────────────
+// value undefined → trigger button ("🎯 target ▾"); value provided →
+// composer-style button showing the current choice. onSelect(value, title);
+// sessions: latest-10 with a reply + "New session" + manual session ID.
+function TargetPicker({ value, trigger, onSelect }) {
+  const [open, setOpen] = useState(false)
+  const [manual, setManual] = useState('')
+  const [manualErr, setManualErr] = useState('')
+  const [sessions, setSessions] = useState(pickerSessions())
+  const boxRef = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    refreshSessionList(true).then((list) => setSessions(list.slice(0, PICKER_SHOW)))
+    return undefined
+  }, [open])
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => {
+      if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+  const currentTitle = value === 'new' ? 'New session' : (sessions.find((s) => s.id === value) || {}).title || value
+  const pick = (v, title) => { onSelect(v, title); setOpen(false) }
+  const btnLabel = trigger || (value === undefined ? '🎯 target' : (value === 'new' ? '🎯 New session' : `🎯 → ${currentTitle}`))
+  return jsxs('div', {
+    ref: boxRef,
+    style: { position: 'relative', flex: trigger ? 'none' : 1 },
+    children: [
+      jsxs('button', {
+        type: 'button',
+        onClick: () => setOpen(!open),
+        style: {
+          width: '100%', display: 'flex', alignItems: 'center', gap: '5px',
+          border: '1px solid var(--ui-stroke-secondary)', borderRadius: '5px',
+          background: 'transparent', color: 'var(--ui-text-secondary)',
+          fontSize: '0.6875rem', padding: '4px 7px', cursor: 'pointer',
+        },
+        children: [
+          jsx('span', {
+            style: { flex: 1, textAlign: 'left', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+            children: btnLabel,
+          }),
+          jsx('span', { style: { color: 'var(--ui-text-quaternary)', flexShrink: 0 }, children: '▾' }),
+        ],
+      }),
+      open
+        ? jsxs('div', {
+            style: {
+              position: 'absolute', zIndex: 30, left: 0, right: 0, top: '100%', marginTop: '2px',
+              background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
+              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', maxHeight: '240px', overflowY: 'auto',
+            },
+            children: [
+              jsxs('div', {
+                onClick: () => pick('new', null),
+                style: { padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer', color: value === 'new' ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: value === 'new' ? 600 : 400 },
+                children: ['＋ New session'],
+              }),
+              sessions.length === 0
+                ? jsx('div', { style: { padding: '5px 9px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No sessions with a reply yet' })
+                : null,
+              sessions.map((s) =>
+                jsxs('div', {
+                  key: s.id,
+                  title: s.id,
+                  onClick: () => pick(s.id, s.title),
+                  style: {
+                    padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer',
+                    color: value === s.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
+                    fontWeight: value === s.id ? 600 : 400,
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                  },
+                  children: [s.title],
+                }),
+              ),
+              jsxs('div', {
+                style: { display: 'flex', gap: '4px', padding: '6px 7px', borderTop: '1px solid var(--ui-stroke-secondary)' },
+                children: [
+                  jsx('input', {
+                    value: manual,
+                    onChange: (e) => { setManual(e.target.value); setManualErr('') },
+                    placeholder: '…or paste a session ID',
+                    style: {
+                      flex: 1, minWidth: 0, fontSize: '0.65rem', padding: '3px 6px',
+                      border: '1px solid ' + (manualErr ? 'var(--ui-text-secondary)' : 'var(--ui-stroke-secondary)'),
+                      borderRadius: '4px', background: 'transparent', color: 'var(--ui-text-secondary)',
+                    },
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    onClick: () => {
+                      const idm = manual.trim()
+                      if (!/^\d{8}_\d{6}_[0-9a-f]{6}$/i.test(idm)) {
+                        setManualErr('expected YYYYMMDD_HHMMSS_hex6')
+                        return
+                      }
+                      pick(idm, idm)
+                    },
+                    style: {
+                      border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
+                      color: 'var(--ui-text-secondary)', fontSize: '0.65rem',
+                      borderRadius: '4px', padding: '3px 7px', cursor: 'pointer',
+                    },
+                    children: 'Set',
+                  }),
+                ],
+              }),
+              manualErr
+                ? jsx('div', { style: { padding: '0 9px 6px', fontSize: '0.625rem', color: 'var(--ui-text-secondary)' }, children: manualErr })
+                : null,
+            ],
+          })
+        : null,
+    ],
+  })
+}
+
 function CardRow({ c, onDragStart, onDropOn }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -513,6 +696,30 @@ function CardRow({ c, onDragStart, onDropOn }) {
               }),
             ],
           }),
+          !live
+            ? jsxs('div', {
+                style: { display: 'flex', alignItems: 'center', gap: '5px', marginTop: '3px' },
+                children: [
+                  jsx(TargetPicker, {
+                    trigger: '🎯 target ▾',
+                    onSelect: (v, t) => patchCard(c.id, { target: v, targetTitle: t || null }),
+                  }),
+                  c.target && c.target !== 'new'
+                    ? jsxs('Tip', {
+                        label: `Follow-up into: ${c.targetTitle || c.target}`,
+                        children: jsx('span', {
+                          style: {
+                            fontSize: '0.625rem', color: 'var(--ui-text-quaternary)',
+                            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                            maxWidth: '110px', flexShrink: 1,
+                          },
+                          children: `→ ${c.targetTitle || c.target}`,
+                        }),
+                      })
+                    : null,
+                ],
+              })
+            : null,
           editing
             ? jsx('textarea', {
                 value: draft,
@@ -581,6 +788,8 @@ function CardRow({ c, onDragStart, onDropOn }) {
 function Board() {
   const q = useQueue()
   const [draft, setDraft] = useState('')
+  const [draftTarget, setDraftTarget] = useState('new')
+  const [draftTargetTitle, setDraftTargetTitle] = useState(null)
   const dragId = useRef(null)
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
@@ -593,7 +802,10 @@ function Board() {
     done: q.cards.filter((c) => c.status === 'done').length,
     failed: q.cards.filter((c) => c.status === 'failed').length,
   }
-  const submit = () => { addCard(draft); setDraft('') }
+  const submit = () => {
+    addCard(draft, draftTarget, draftTargetTitle)
+    setDraft('')
+  }
 
   return jsxs('div', {
     style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: '140px', fontFamily: 'inherit' },
@@ -653,34 +865,43 @@ function Board() {
             ),
       }),
       jsxs('div', {
-        style: { display: 'flex', gap: '5px', padding: '6px 8px', borderTop: '1px solid var(--ui-stroke-secondary)', alignItems: 'flex-end' },
+        style: { display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 8px', borderTop: '1px solid var(--ui-stroke-secondary)' },
         children: [
-          jsx('textarea', {
-            placeholder: 'Add a prompt… (each = new session)',
-            value: draft,
-            onChange: (e) => setDraft(e.target.value),
-            onKeyDown: (e) => {
-              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit() }
-            },
-            rows: 2,
-            style: {
-              flex: 1, fontSize: '0.7rem', resize: 'none',
-              background: 'transparent',
-              color: 'var(--ui-text-secondary)',
-              border: '1px solid var(--ui-stroke-secondary)',
-              borderRadius: '5px', padding: '4px 6px',
-            },
+          jsx(TargetPicker, {
+            value: draftTarget,
+            onSelect: (v, t) => { setDraftTarget(v); setDraftTargetTitle(t || null) },
           }),
-          jsx('button', {
-            onClick: submit,
-            disabled: !draft.trim(),
-            style: {
-              border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
-              color: draft.trim() ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
-              borderRadius: '5px', cursor: draft.trim() ? 'pointer' : 'default',
-              fontSize: '0.7rem', padding: '4px 8px',
-            },
-            children: '+ Add',
+          jsxs('div', {
+            style: { display: 'flex', gap: '5px', alignItems: 'flex-end' },
+            children: [
+              jsx('textarea', {
+                placeholder: 'Add a prompt…',
+                value: draft,
+                onChange: (e) => setDraft(e.target.value),
+                onKeyDown: (e) => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit() }
+                },
+                rows: 2,
+                style: {
+                  flex: 1, fontSize: '0.7rem', resize: 'none',
+                  background: 'transparent',
+                  color: 'var(--ui-text-secondary)',
+                  border: '1px solid var(--ui-stroke-secondary)',
+                  borderRadius: '5px', padding: '4px 6px',
+                },
+              }),
+              jsx('button', {
+                onClick: submit,
+                disabled: !draft.trim(),
+                style: {
+                  border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
+                  color: draft.trim() ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
+                  borderRadius: '5px', cursor: draft.trim() ? 'pointer' : 'default',
+                  fontSize: '0.7rem', padding: '4px 8px',
+                },
+                children: '+ Add',
+              }),
+            ],
           }),
         ],
       }),
