@@ -1,12 +1,24 @@
 // prompt-queue — kanban-style prompt queue for Hermes Desktop.
 //
 // Each card = a prompt. Play (manual) drains the queue strictly top-down:
-//   session.create → prompt.submit → wait turn (message.complete for that
-//   session) → strict review gate (no background review may still be
-//   running) → mark done → close the one-shot session's slot → next card.
+//   GLOBAL GATE (any session working?) → session.create → prompt.submit →
+//   wait turn (message.complete for that session) → strict review gate
+//   (no background review may still be running) → mark done → close the
+//   one-shot session's slot → next card.
 // Every card gets a REAL desktop session (visible in the sidebar); its
 // active-session slot is released after the turn so a long queue can't
 // exhaust the cap.
+//
+// TWO independent gates protect the single local-model slot:
+//   1. Global session gate — session.active_list (authoritative,
+//      process-wide): holds while ANY live session is working/starting/
+//      queued — user follow-ups in other sessions, other surfaces, or a
+//      card's own sub-agents. (The v1 per-card busyBySession wait only
+//      saw sessions the renderer tracked; a follow-up slipped past it.)
+//   2. Per-card review gate — background reviews run on a thread, NOT a
+//      TUI session, so they never appear in active_list. Log-marker
+//      detection (below) + 30 s spawn grace covers the turn→review fork
+//      delay.
 //
 // Renderer-only disk plugin (loaded uncompiled): only @hermes/plugin-sdk /
 // react / react/jsx-runtime resolve. UI is written with jsx() calls.
@@ -34,6 +46,7 @@ const TURN_STALL_MS = 60 * 60 * 1000 // hard fail: turn never completes for an h
 const REVIEW_SPAWN_GRACE_MS = 30000 // reviews fork AFTER the turn ends; wait this long before accepting "none spawned"
 const CLOSE_AFTER_DONE_MS = 3000
 const SUBMIT_RETRIES = 3
+const GLOBAL_POLL_MS = 4000 // cadence for the process-wide "any session working" gate
 const RE_START = /(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
 const RE_DONE = /(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review complete|Background memory\/skill review failed)/
 
@@ -63,7 +76,7 @@ function errMsg(e) {
 }
 
 // ── module-scoped store (survives pane remounts + hot reload) ───────────────
-let state = { cards: [], playing: false, hydrated: false }
+let state = { cards: [], playing: false, hydrated: false, modelBusy: false }
 const subs = new Set()
 let persistTimer = null
 let engineCtx = null
@@ -130,6 +143,54 @@ async function reviewCleared() {
   }
 }
 
+// ── global model-slot gate ─────────────────────────────────────────────────
+// session.active_list is the AUTHORITATIVE process-wide signal (gateway
+// source: _session_live_status → 'working' mid-turn, 'starting' agent
+// build, 'waiting' queued prompt, 'idle'). Renderer-derived busyBySession
+// only sees sessions the UI tracks, which is how a user follow-up in
+// another session used to slip past the queue.
+async function anySessionWorking() {
+  try {
+    const res = await host.request('session.active_list', {})
+    const rows = (res && res.sessions) || []
+    return rows.some((s) => s.status === 'working' || s.status === 'starting' || s.status === 'waiting')
+  } catch {
+    return false // RPC blip: one 4s cycle of fail-open, next cycle re-checks
+  }
+}
+
+// Resolves 'free' after two consecutive clear readings (kills single-blip
+// false-clears), 'paused' if the queue stops playing while waiting.
+function waitForModelFree() {
+  return new Promise((resolve) => {
+    let clearStreak = 0
+    let stopped = false
+    let interval = null
+    const check = async () => {
+      if (stopped) return
+      const busy = await anySessionWorking()
+      if (stopped) return
+      set({ modelBusy: busy })
+      if (!state.playing) {
+        stopped = true
+        if (interval) clearInterval(interval)
+        set({ modelBusy: false })
+        resolve('paused')
+        return
+      }
+      if (busy) clearStreak = 0
+      else if (++clearStreak >= 2) {
+        stopped = true
+        if (interval) clearInterval(interval)
+        set({ modelBusy: false })
+        resolve('free')
+      }
+    }
+    check() // immediately — a just-freed model shouldn't wait a full cycle
+    interval = setInterval(check, GLOBAL_POLL_MS)
+  })
+}
+
 // ── engine ──────────────────────────────────────────────────────────────────
 let inFlight = 0
 const turnTimers = new Map()   // card id → { interval, timeout }
@@ -151,9 +212,16 @@ async function submitWithRetry(sid, text) {
 async function pump() {
   if (inFlight > 0 || !state.playing) return
   const next = state.cards.find((c) => c.status === 'queued')
-  if (!next) return
+  if (!next) { set({ modelBusy: false }); return }
   inFlight++
   try {
+    // GLOBAL GATE: hold while ANY live session is working/starting/queued
+    // (user follow-ups, other surfaces, a card's own sub-agents) — the
+    // model is single-slot, and this is what a follow-up in another
+    // session used to slip past (per-card waitTurn only watched its own
+    // session).
+    const verdict = await waitForModelFree()
+    if (verdict === 'paused' || !state.playing) return
     await runCard(next.id)
   } catch (e) {
     patchCard(next.id, { status: 'failed', err: 'engine: ' + errMsg(e), ts: Date.now() })
@@ -168,6 +236,13 @@ async function runCard(id) {
   if (!c) return
 
   // 1 — create the real session
+  // Final pre-launch check: the global gate again, so a review that forked
+  // after the per-card spawn grace closed still holds the next card.
+  const pre = await anySessionWorking()
+  if (pre) {
+    const v2 = await waitForModelFree()
+    if (v2 === 'paused') return
+  }
   patchCard(id, { status: 'launching', ts: Date.now(), err: null })
   let created
   try {
@@ -538,8 +613,10 @@ function Board() {
             children: q.playing ? '❚❚ Pause' : '▶ Play',
           }),
           jsx('span', {
-            style: { fontSize: '0.65rem', color: 'var(--ui-text-quaternary)', marginLeft: 'auto' },
-            children: `${counts.queued} queued · ${counts.done} done${counts.failed ? ` · ${counts.failed} failed` : ''}`,
+            style: { fontSize: '0.65rem', color: q.playing && q.modelBusy ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)', marginLeft: 'auto' },
+            children: q.playing && q.modelBusy
+              ? '⏳ waiting for model…'
+              : `${counts.queued} queued · ${counts.done} done${counts.failed ? ` · ${counts.failed} failed` : ''}`,
           }),
           counts.done > 0
             ? jsx('button', {
@@ -615,18 +692,29 @@ function Chip() {
   const q = useQueue()
   const active = q.cards.filter((c) => ['launching', 'running', 'review-wait'].includes(c.status)).length
   const queued = q.cards.filter((c) => c.status === 'queued').length
-  const label = q.playing
-    ? `queue · ${active || 0} active, ${queued} next`
-    : queued
-      ? `queue paused · ${queued} waiting`
-      : 'queue idle'
-  const color = q.playing ? 'var(--ui-accent)' : 'var(--ui-text-tertiary)'
+  let label
+  let color
+  if (q.playing && q.modelBusy) {
+    label = 'queue · waiting for model'
+    color = 'var(--ui-accent)'
+  } else if (q.playing) {
+    label = `queue · ${active || 0} active, ${queued} next`
+    color = 'var(--ui-accent)'
+  } else if (queued) {
+    label = `queue paused · ${queued} waiting`
+    color = 'var(--ui-text-tertiary)'
+  } else {
+    label = 'queue idle'
+    color = 'var(--ui-text-tertiary)'
+  }
   return jsxs(Tip, {
-    label: q.playing
-      ? 'Prompt queue is draining: each card becomes a new session, strictly one at a time, gated on background-review completion.'
-      : queued
-        ? 'Prompt queue is paused. Press Play on the board (bottom-left) to resume.'
-        : 'Prompt queue: add prompts on the board (bottom-left). Play drains them one by one into new sessions.',
+    label: q.playing && q.modelBusy
+      ? 'A session is still using the model (your follow-ups, other surfaces, or a card\'s sub-agents). The queue holds the next prompt until it — and any background review — is fully done.'
+      : q.playing
+        ? 'Prompt queue is draining: each card becomes a new session, strictly one at a time, gated on every session finishing + background-review completion.'
+        : queued
+          ? 'Prompt queue is paused. Press Play on the board (bottom-left) to resume.'
+          : 'Prompt queue: add prompts on the board (bottom-left). Play drains them one by one into new sessions.',
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '5px', height: '100%', padding: '0 6px', fontSize: '0.6875rem', color, whiteSpace: 'nowrap' },
       children: [
