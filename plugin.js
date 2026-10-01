@@ -42,7 +42,12 @@ import { useSyncExternalStore, useState, useEffect, useRef } from 'react'
 const STORE_KEY = 'prompt-queue-state-v1'
 const REVIEW_POLL_MS = 20000
 const TURN_FALLBACK_POLL_MS = 10000
-const TURN_STALL_MS = 60 * 60 * 1000 // hard fail: turn never completes for an hour
+// Last-resort backstop: fail a card only if its session shows NO completion
+// for this long after submit. Sized for local-model turns (observed up to
+// ~3.7h on this box); 1h fired false "turn stall" failures on healthy long
+// turns. Real completions are caught by message.complete + the 10s busy
+// poll, so this only trips on genuinely hung sessions.
+const TURN_STALL_MS = 12 * 60 * 60 * 1000
 const REVIEW_SPAWN_GRACE_MS = 30000 // reviews fork AFTER the turn ends; wait this long before accepting "none spawned"
 const CLOSE_AFTER_DONE_MS = 3000
 const SUBMIT_RETRIES = 3
@@ -223,6 +228,16 @@ function pickerSessions() { return sessionCache.list.slice(0, PICKER_SHOW) }
 let inFlight = 0
 const turnTimers = new Map()   // card id → { interval, timeout }
 const reviewTimers = new Map() // card id → interval
+// card id → { phase, idleSince }: cards whose prompt the gateway QUEUED
+// behind the target's in-flight turn (submit response status "queued").
+//   phase 'inflight' — the target's current turn is still running; its
+//     message.complete is NOT ours (poll flips to 'gap' when busy clears,
+//     or the event handler flips it when the completion lands).
+//   phase 'gap'      — in-flight turn ended, drain pending. The session is
+//     idle in this gap; the gateway restarts it with our prompt within
+//     seconds (busy true again → entry dropped, normal tracking resumes).
+//     If the drain never starts within 90s, the card fails cleanly.
+const queuedBehind = new Map()
 
 async function submitWithRetry(sid, text) {
   let lastErr = null
@@ -312,13 +327,21 @@ async function runCard(id) {
   }
   patchCard(id, { sid, stored, status: 'running', ts: Date.now() })
 
-  // 2 — send the prompt
+  // 2 — send the prompt. If the target is mid-turn the gateway ACCEPTS but
+  // QUEUES it (response status "queued"); the prompt runs after the in-flight
+  // turn ends. Track that so waitTurn skips the in-flight turn's completion
+  // (which would otherwise mark us done before our turn even starts).
+  let subRes
   try {
-    await submitWithRetry(sid, c.text)
+    subRes = await submitWithRetry(sid, c.text)
   } catch (e) {
     patchCard(id, { status: 'failed', err: 'prompt.submit: ' + errMsg(e), ts: Date.now() })
     if (isNew) host.request('session.close', { session_id: sid }).catch(() => {}) // never close a target session
     return
+  }
+  if (subRes && (subRes.status === 'queued' || subRes.status === 'pending')) {
+    queuedBehind.set(id, { phase: 'inflight', idleSince: null })
+    patchCard(id, { queuedBehind: true, ts: Date.now() })
   }
 
   // 3 — wait for turn completion
@@ -326,7 +349,8 @@ async function runCard(id) {
   const cur = card(id)
   if (!cur || cur.status === 'failed' || cur.status === 'done') return // removed/failed meanwhile
   if (!ok) {
-    patchCard(id, { status: 'failed', err: 'turn stall: no completion after 1h (session left open)', ts: Date.now() })
+    const hours = Math.round(TURN_STALL_MS / 3600000)
+    patchCard(id, { status: 'failed', err: `turn stall: no completion after ${hours}h (session left open)`, ts: Date.now() })
     return // don't close a session that may still be working
   }
 
@@ -348,7 +372,7 @@ async function runCard(id) {
 }
 
 // Resolves true when the turn completed (event or busy=false watchdog),
-// false on the 1h stall.
+// false on the stall backstop (TURN_STALL_MS).
 function waitTurn(id, sid) {
   return new Promise((resolve) => {
     let settled = false
@@ -357,12 +381,29 @@ function waitTurn(id, sid) {
       settled = true
       const t = turnTimers.get(id)
       if (t) { clearInterval(t.interval); clearTimeout(t.timeout); turnTimers.delete(id) }
+      queuedBehind.delete(id)
       resolve(ok)
     }
     const interval = setInterval(() => {
       const c = card(id)
       if (!c) return finish(true)
       if (c.status !== 'running' && c.status !== 'launching') return finish(true)
+      const q = queuedBehind.get(id)
+      if (q) {
+        const busy = isBusy(sid)
+        if (q.phase === 'inflight') {
+          if (busy) return // target's in-flight turn still running — not ours
+          q.phase = 'gap' // turn ended (completion pending or missed)
+        }
+        // phase 'gap': between the in-flight completion and our drain.
+        if (busy) { queuedBehind.delete(id); return } // our turn started
+        if (q.idleSince == null) q.idleSince = Date.now()
+        else if (Date.now() - q.idleSince > 90 * 1000) {
+          patchCard(id, { status: 'failed', err: 'queued in target, but the queued turn never started (session left open)', ts: Date.now() })
+          finish(true)
+        }
+        return
+      }
       if (!isBusy(sid)) {
         // busy cleared — give a late message.complete a beat to land first
         setTimeout(() => {
@@ -423,6 +464,7 @@ function removeCard(id) {
   if (!c) return
   if (c.status === 'launching' || c.status === 'running' || c.status === 'review-wait') return
   set({ cards: state.cards.filter((x) => x.id !== id) })
+  queuedBehind.delete(id)
 }
 function clearDone() { set({ cards: state.cards.filter((c) => c.status !== 'done') }) }
 function openCardSession(c) {
@@ -497,6 +539,17 @@ function ensureWired() {
     if (!sid) return
     const c = state.cards.find((x) => x.sid === sid && (x.status === 'running' || x.status === 'launching'))
     if (!c) return
+    // Prompt queued behind the target's in-flight turn: THAT turn's
+    // completion is not ours — flip to 'gap' and wait for the drain.
+    // (If a completion arrives in 'gap', it's the drained turn's — a fast
+    // turn that finished before the poll saw busy=true — so let it promote.)
+    const q = queuedBehind.get(c.id)
+    if (q && q.phase === 'inflight') {
+      q.phase = 'gap'
+      q.idleSince = null
+      return
+    }
+    queuedBehind.delete(c.id)
     // let the commit settle, then promote if the watchdog hasn't beaten us
     setTimeout(() => {
       const c2 = card(c.id)
@@ -661,6 +714,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
   const [draft, setDraft] = useState('')
   const meta = STATUS_META[c.status] || STATUS_META.queued
   const live = c.status === 'running' || c.status === 'launching' || c.status === 'review-wait'
+  const queuedInTarget = c.queuedBehind && (c.status === 'running' || c.status === 'launching')
   const elapsed = (c.status === 'running' || c.status === 'review-wait' || c.status === 'launching') ? Date.now() - (c.ts || Date.now()) : null
   return jsxs('div', {
     draggable: !live,
@@ -692,7 +746,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
               }),
               jsx('span', {
                 style: { fontSize: '0.625rem', color: meta.color, whiteSpace: 'nowrap', flexShrink: 0 },
-                children: meta.label + (elapsed != null ? ` · ${ago(elapsed)}` : ''),
+                children: (queuedInTarget ? '⏳ queued in target' : meta.label) + (elapsed != null ? ` · ${ago(elapsed)}` : ''),
               }),
             ],
           }),

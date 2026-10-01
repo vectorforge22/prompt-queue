@@ -47,7 +47,12 @@ queued → launching → running → review-wait → done
 ```
 
 Per-card watchdogs: 10 s `busyBySession` poll (missed-event fallback),
-1 h hard stall → `failed` (session left open, not force-closed).
+12 h hard stall → `failed` (session left open, not force-closed). Sized for
+local-model turns (observed 1–4 h on this box); real completions come from
+`message.complete` + the poll, the stall is only the hung-session tripwire.
+If the gateway queues a prompt behind a target's in-flight turn (submit
+response `status: "queued"`), the card shows `⏳ queued in target` and
+completes on the *drained* turn's completion, not the in-flight one.
 
 ## Install
 
@@ -75,7 +80,7 @@ in `tui_gateway/` + `apps/desktop/src/sdk` source).
 
 - The engine never submits into a mid-turn session (one card at a time — the
   global gate also holds target cards whose session is mid-turn), but a card
-  whose turn stalls >1 h fails with the session left running rather than
+  whose turn stalls >12 h fails with the session left running rather than
   force-closing it.
 - Reorder only applies to non-live cards (a live card is mid-flight).
 - The review gate is global (one review can run app-wide), matching the

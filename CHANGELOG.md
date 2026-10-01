@@ -3,6 +3,55 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## Unreleased (on `unreleased` branch, since 2026-10-01)
+
+Diagnosed against a real incident: a card targeting a research session
+(`20260925_131637_57043f`) failed with `turn stall: no completion after 1h`
+while the target's turn legitimately ran **3 h 22 m** (gateway
+`agent.log`: prompt accepted 02:27:39, `Turn ended … duration=12116.2s` at
+05:49:35). The card's prompt also "appeared late" in the target window.
+
+### Fixed
+
+- **False "turn stall" failures on long local-model turns.** The per-card
+  stall backstop was hardcoded to 1 h, calibrated for cloud-model turns.
+  Against local-model turns that routinely run 1–4 h on this box, it marked
+  healthy cards `failed` after an hour while the turn was still working (the
+  later real `message.complete` was ignored because the card was already
+  failed). The backstop is now **12 h** — still a last-resort tripwire for
+  genuinely hung sessions; real completions are caught by
+  `message.complete` + the 10 s busy poll, exactly as before. The failure
+  message now derives from the constant (`…after 12h…`).
+- **Cards queued behind a busy target now track the right turn.** When the
+  target is mid-turn, the gateway **accepts** the prompt but **queues** it
+  behind the in-flight turn (response `status: "queued"`; the prompt only
+  runs once the in-flight turn ends — this is why a queued prompt "appears
+  late" in the target window). Previously the in-flight turn's
+  `message.complete` would resolve the card as done **before the queued
+  prompt's own turn had even started**. Now the card:
+  - shows a live **`⏳ queued in target`** status (with elapsed time), so the
+    wait is visible instead of silent;
+  - ignores the in-flight turn's completion and the idle gap after it, and
+    only completes when the drained turn's own `message.complete` lands (a
+    10 s busy poll covers a fast drained turn that finishes before the poll
+    sees `busy` again);
+  - fails cleanly (`queued in target, but the queued turn never started`) if
+    the drain never starts within 90 s.
+
+### Unchanged
+
+- **The global model-slot gate still holds cards while any session works** —
+  including your own chat. A card targeting a session that is idle but whose
+  *model* is busy in another session waits at the gate (status bar:
+  `queue · waiting for model`) before it submits; that wait is expected, not
+  a hang.
+- Target sessions are still never closed by the plugin.
+
+### Migration
+
+- None needed. The new `queuedBehind` card flag is additive; saved queues
+  from earlier versions load unchanged.
+
 ## 2026-09-26 — Card targets: follow-ups into existing sessions (C1)
 
 Cards can now run **into an existing session** instead of always creating a
