@@ -16,8 +16,13 @@ slot — while keeping every session visible in the normal sidebar.
 - **Pane** — docked below the session list (bottom-left of the default layout);
   drag it anywhere.
 - **Cards** — add (textarea, Ctrl/⌘+Enter or **+ Add**), edit (✎), reorder
-  (drag ⋮⋮), remove (×), retry failed (↻), open the card's session (↗), clear
-  done (✕ done).
+  (drag ⋮⋮), retry failed (↻), open the card's session (↗). The **×** on a
+  card opens a small menu: **↷ Skip** (moves it to the Skipped tab),
+  **✓ Mark done** (→ Done), or **✕ Delete** (removes it) — so an accidental ×
+  no longer loses a prompt.
+- **Queue / Done / Skipped / Failed tabs** — finished cards move off the
+  Queue tab so it stays clean (live counts in the labels); Done and Skipped
+  have a **✕ clear** button; only the Queue tab is drag-reorderable.
 - **Strict review gate** — no new prompt is fired while a background
   memory/skill review is still running (detection: `review.summary` event +
   `thread=bg-review` log markers, 30 s spawn grace, 20 s poll, **fail-closed

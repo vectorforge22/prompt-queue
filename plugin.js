@@ -36,7 +36,7 @@
 
 import { host, Tip, STATUSBAR_AREAS, TRANSCRIPT_DIRECTIVE_AREA } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useSyncExternalStore, useState, useEffect, useRef } from 'react'
+import { useSyncExternalStore, useState, useEffect, useRef, Fragment } from 'react'
 
 // ── constants ───────────────────────────────────────────────────────────────
 const STORE_KEY = 'prompt-queue-state-v1'
@@ -515,7 +515,60 @@ function removeCard(id) {
   set({ cards: state.cards.filter((x) => x.id !== id) })
   queuedBehind.delete(id)
 }
-function clearDone() { set({ cards: state.cards.filter((c) => c.status !== 'done') }) }
+function clearStatus(status) { set({ cards: state.cards.filter((c) => c.status !== status) }) }
+function clearDone() { clearStatus('done') }
+function clearSkipped() { clearStatus('skipped') }
+
+// ── card action menu (the × button) ─────────────────────────────────────────
+// Deleting a card is a bit destructive, so × opens a small choice instead:
+// Skip it (→ Skipped tab), mark it done (→ Done tab), or delete it for real.
+function CardActionsMenu({ c }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+  const item = (label, fn, danger) => jsx('button', {
+    onClick: () => { setOpen(false); fn() },
+    style: {
+      display: 'block', width: '100%', textAlign: 'left',
+      border: 'none', background: 'transparent', cursor: 'pointer',
+      color: danger ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
+      fontSize: '0.65rem', padding: '3px 4px', borderRadius: '3px',
+    },
+    children: label,
+  })
+  return jsxs('div', {
+    ref,
+    style: { position: 'relative', display: 'flex', alignItems: 'center' },
+    children: [
+      jsx('button', {
+        title: 'Skip, mark done, or delete',
+        onClick: () => setOpen(!open),
+        style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.7rem', padding: '1px 3px', borderRadius: '3px' },
+        children: '×',
+      }),
+      open
+        ? jsx('div', {
+            style: {
+              position: 'absolute', zIndex: 40, top: '100%', right: 0, marginTop: '2px',
+              background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
+              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', padding: '3px 4px', width: '128px',
+            },
+            children: [
+              item('↷ Skip', () => patchCard(c.id, { status: 'skipped', doneAt: Date.now(), ts: Date.now() })),
+              item('✓ Mark done', () => patchCard(c.id, { status: 'done', doneAt: Date.now(), ts: Date.now() })),
+              item('✕ Delete', () => removeCard(c.id), true),
+            ],
+          })
+        : null,
+    ],
+  })
+}
 function openCardSession(c) {
   const key = c.stored || c.target
   if (key && key !== 'new') host.openSession(key).catch(() => {})
@@ -623,6 +676,7 @@ const STATUS_META = {
   running: { color: 'var(--ui-accent)', label: 'running' },
   'review-wait': { color: 'var(--ui-accent)', label: 'review gate' },
   done: { color: 'var(--ui-text-quaternary)', label: 'done' },
+  skipped: { color: 'var(--ui-text-quaternary)', label: 'skipped' },
   failed: { color: 'var(--ui-text-secondary)', label: 'failed' },
 }
 
@@ -645,10 +699,15 @@ function StatusDot({ status }) {
 function SettingsMenu() {
   const s = useSettings()
   const [open, setOpen] = useState(false)
-  const ref = useRef(null)
   useEffect(() => {
     if (!open) return
-    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    // The button and the menu are SIBLINGS inside the (positioned) header
+    // row, so a wrapper-ref hit test can't see both — tag them with an
+    // attribute and treat any click outside as "close".
+    const onDoc = (e) => {
+      const el = e.target && e.target.closest ? e.target.closest('[data-pq-settings]') : null
+      if (!el) setOpen(false)
+    }
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
   }, [open])
@@ -659,11 +718,13 @@ function SettingsMenu() {
     color: active ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)',
     borderRadius: '4px', cursor: 'pointer', fontSize: '0.65rem', padding: '1px 7px',
   })
-  return jsxs('div', {
-    ref,
-    style: { position: 'relative' },
+  // Fragment: the dropdown anchors to the header row (position:relative),
+  // NOT to a wrapper around the gear button — anchoring to the button's own
+  // width pushed the 250px menu leftward out of the app window.
+  return jsxs(Fragment, {
     children: [
       jsx('button', {
+        'data-pq-settings': 'trigger',
         title: 'Prompt Queue settings',
         onClick: () => setOpen(!open),
         style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.8rem', padding: '1px 3px', borderRadius: '3px' },
@@ -671,8 +732,9 @@ function SettingsMenu() {
       }),
       open
         ? jsx('div', {
+            'data-pq-settings': 'menu',
             style: {
-              position: 'absolute', zIndex: 40, top: '100%', right: 0, marginTop: '2px',
+              position: 'absolute', zIndex: 40, top: '100%', right: '6px', marginTop: '2px',
               background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
               border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
               boxShadow: '0 8px 24px rgba(0,0,0,0.35)', padding: '6px', width: '250px',
@@ -958,12 +1020,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
               })
             : null,
           !live
-            ? jsx('button', {
-                title: 'Remove',
-                onClick: () => removeCard(c.id),
-                style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.7rem', padding: '1px 3px', borderRadius: '3px' },
-                children: '×',
-              })
+            ? jsx(CardActionsMenu, { c })
             : null,
         ],
       }),
@@ -992,14 +1049,16 @@ function Board() {
   // Only the Queue tab is reorderable (that's the drain order).
   const [tab, setTab] = useState('queue')
   const tabCards = {
-    queue: q.cards.filter((c) => c.status !== 'done' && c.status !== 'failed'),
+    queue: q.cards.filter((c) => c.status !== 'done' && c.status !== 'failed' && c.status !== 'skipped'),
     done: q.cards.filter((c) => c.status === 'done'),
+    skipped: q.cards.filter((c) => c.status === 'skipped'),
     failed: q.cards.filter((c) => c.status === 'failed'),
   }
 
   const counts = {
-    queued: q.cards.filter((c) => c.status === 'queued').length,
+    queued: q.cards.filter((c) => c.status !== 'done' && c.status !== 'failed' && c.status !== 'skipped').length,
     done: q.cards.filter((c) => c.status === 'done').length,
+    skipped: q.cards.filter((c) => c.status === 'skipped').length,
     failed: q.cards.filter((c) => c.status === 'failed').length,
   }
   const submit = () => {
@@ -1011,7 +1070,7 @@ function Board() {
     style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: '140px', fontFamily: 'inherit' },
     children: [
       jsxs('div', {
-        style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 8px', borderBottom: '1px solid var(--ui-stroke-secondary)' },
+        style: { position: 'relative', display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 8px', borderBottom: '1px solid var(--ui-stroke-secondary)' },
         children: [
           jsx('button', {
             title: q.playing ? 'Pause queue' : 'Play queue — the next queued card starts a new session',
@@ -1040,6 +1099,7 @@ function Board() {
           [
             ['queue', `Queue · ${counts.queued}`],
             ['done', `Done · ${counts.done}`],
+            ['skipped', `Skipped · ${counts.skipped}`],
             ['failed', `Failed · ${counts.failed}`],
           ].map(([k, label]) =>
             jsx('button', {
@@ -1060,6 +1120,15 @@ function Board() {
                 key: 'clear-done',
                 title: 'Clear done cards',
                 onClick: () => clearDone(),
+                style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.65rem', padding: '2px 4px', borderRadius: '3px' },
+                children: '✕ clear',
+              })
+            : null,
+          tab === 'skipped' && counts.skipped > 0
+            ? jsx('button', {
+                key: 'clear-skipped',
+                title: 'Clear skipped cards',
+                onClick: () => clearSkipped(),
                 style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.65rem', padding: '2px 4px', borderRadius: '3px', marginLeft: 'auto' },
                 children: '✕ clear',
               })
@@ -1076,7 +1145,9 @@ function Board() {
                   ? 'Empty. Add a prompt below — each one runs in its own new session, visible in the sidebar.'
                   : tab === 'done'
                     ? 'No done cards yet.'
-                    : 'No failed cards yet.',
+                    : tab === 'skipped'
+                      ? 'No skipped cards yet. The × on a card can skip it (or mark it done) instead of deleting.'
+                      : 'No failed cards yet.',
             })
           : tabCards[tab].map((c) =>
               jsx(CardRow, {

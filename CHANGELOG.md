@@ -59,6 +59,14 @@ while the target's turn legitimately ran **3 h 22 m** (gateway
   The old header `✕ done` moved to the Done tab as `✕ clear`. Only the Queue
   tab is drag-reorderable (that's the drain order); Done/Failed cards keep
   their usual retry/remove/open-session controls.
+- **Skipped tab + card action menu.** A fourth tab (`Skipped`) joins Queue /
+  Done / Failed, and the card's **×** now opens a small menu — **↷ Skip**
+  (→ Skipped), **✓ Mark done** (→ Done), **✕ Delete** — instead of deleting
+  instantly, so an accidental click no longer loses a prompt.
+- **Settings menu no longer clips.** The gear (⚙) dropdown now anchors to the
+  pane header row (`position: relative` on the header, `right: 6px`) instead
+  of to a wrapper around the gear button — anchoring to the button's own
+  width pushed the 250px menu leftward out of the app window.
 - **Session picker opens up when it would run off the bottom of the window.**
   `TargetPicker` now measures the trigger against the viewport on open and
   flips the menu upward when opening downward would pass the window bottom
