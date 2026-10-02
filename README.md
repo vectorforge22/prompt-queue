@@ -76,6 +76,62 @@ A desktop build recent enough for: `host.request` gateway RPCs
 Developed and verified against the 2026-09 build (all of the above confirmed
 in `tui_gateway/` + `apps/desktop/src/sdk` source).
 
+## Trust & Autonomy
+
+A card is not a draft — once the engine fires it, it becomes a **full agent
+turn** in a real session, with that session's complete tool access
+(terminal, files, web, whatever that profile allows). Queue prompts the way
+you'd queue autonomous work.
+
+**What the plugin does and doesn't touch:**
+
+- **No network calls.** It never fetches or sends anything beyond the
+  Hermes gateway RPCs listed in Requirements (same machine, same gateway).
+- **No credential access.** It reads no keys, tokens, or profile data.
+- **Log tail for the review gate.** It reads the last 1000 lines of
+  `agent.log` (filtered for `bg-review` markers) to know when a background
+  review is running. That log is your own, but it can contain content from
+  *other* sessions; the gate parses timestamps and markers only — nothing is
+  stored or displayed.
+
+**Card sources and their trust level:**
+
+| Source | Trust | Behavior |
+|---|---|---|
+| Textarea / picker (you typed it) | user-approved | added directly; runs only while Play is active |
+| `::enqueue{prompt="…"}` (a chat turn wrote it) | **untrusted model output** — the platform contract for transcript directives is that attributes are untrusted model output | currently: auto-adds the card; it runs only while Play is active |
+
+The `::enqueue` path is the one a prompt injection could exploit: a
+model-generated (or model-relayed, e.g. quoted from a web page or file)
+directive can place a card in the queue that you never typed yourself.
+**Mitigations in progress** (CHANGELOG, Unreleased → Planned): default
+**ask-before-queue** (the chip shows a *pending* card you click to accept),
+fixed dedup, and a pane-header gear to control the behavior. Until those
+ship, treat "Play active" as "model-suggested cards will run."
+
+**Review gate semantics.** The gate holds the queue while a background
+self-improvement review is running. If the log check itself fails (a
+transient `host.logs` blip), the current build **fails open** — it proceeds
+and the next 20 s re-poll retries. This is being hardened to **fail-closed**
+by default (hold + a visible "review verification unavailable" state), with
+fail-open kept as an explicit opt-in in the gear.
+
+## Performance notes (local models)
+
+Each card's default target is a **new session**. On local-model setups,
+creating or switching sessions can mean (re)loading KV-cache context for the
+session — a compute cost that grows with context length, and it's why a
+frequent pattern here is fewer, longer sessions rather than many short ones.
+Practical guidance:
+
+- **One-shot, independent prompts** — the default (new session per card) is
+  fine and keeps each run isolated.
+- **Iterative work on the same topic** — point the cards at **one existing
+  session** (🎯 target) so follow-ups reuse that session's context instead of
+  paying a fresh load per card.
+- Keep each prompt **self-contained**: a card in a new session has no memory
+  of the other cards.
+
 ## Known limitations
 
 - The engine never submits into a mid-turn session (one card at a time — the
@@ -95,8 +151,10 @@ in `tui_gateway/` + `apps/desktop/src/sdk` source).
 
 ## Listing (AtlasOmnia community-plugins)
 
-```
-| [Prompt Queue](https://github.com/vectorforge22/prompt-queue) | Kanban-style prompt queue: Play drains cards one at a time, each into a new sidebar session, gated on background-review completion | [@vectorforge22](https://github.com/vectorforge22) |
-```
-
-Suggested category: **Tasks & Notes** (or Collaboration & Workflow).
+Listed via [PR #7](https://github.com/AtlasOmnia/community-plugins/pull/7)
+— incorporated in `48bc95a` (2026-09-30) as a directory listing, not a
+certification. The maintainer's blocking review raised three findings
+(untrusted `::enqueue` output, broken directive dedup, fail-open review
+gate); all are being addressed on the `unreleased` branch — see CHANGELOG
+(Unreleased → Planned) and the [Trust & Autonomy](#trust--autonomy) section
+above.
