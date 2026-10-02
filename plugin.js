@@ -593,12 +593,26 @@ function StatusDot({ status }) {
 // value undefined → trigger button ("🎯 target ▾"); value provided →
 // composer-style button showing the current choice. onSelect(value, title);
 // sessions: latest-10 with a reply + "New session" + manual session ID.
-function TargetPicker({ value, trigger, onSelect, openUp }) {
+function TargetPicker({ value, trigger, onSelect }) {
   const [open, setOpen] = useState(false)
+  const [goUp, setGoUp] = useState(false)
   const [manual, setManual] = useState('')
   const [manualErr, setManualErr] = useState('')
   const [sessions, setSessions] = useState(pickerSessions())
   const boxRef = useRef(null)
+  // On open: measure the trigger against the viewport and flip the menu
+  // upward when it would run past the bottom of the window. This is why the
+  // composer picker opens up (it sits at the pane's bottom) and a card's
+  // picker near the top still opens down.
+  const toggleOpen = () => {
+    if (!open) {
+      try {
+        const r = boxRef.current && boxRef.current.getBoundingClientRect()
+        if (r) setGoUp(r.bottom + 240 + 12 > (window.innerHeight || 768))
+      } catch { /* */ }
+    }
+    setOpen(!open)
+  }
   useEffect(() => {
     if (!open) return
     refreshSessionList(true).then((list) => setSessions(list.slice(0, PICKER_SHOW)))
@@ -621,7 +635,7 @@ function TargetPicker({ value, trigger, onSelect, openUp }) {
     children: [
       jsxs('button', {
         type: 'button',
-        onClick: () => setOpen(!open),
+        onClick: toggleOpen,
         style: {
           width: '100%', display: 'flex', alignItems: 'center', gap: '5px',
           border: '1px solid var(--ui-stroke-secondary)', borderRadius: '5px',
@@ -640,9 +654,9 @@ function TargetPicker({ value, trigger, onSelect, openUp }) {
         ? jsxs('div', {
             style: {
               position: 'absolute', zIndex: 30, left: 0, right: 0,
-              // openUp: menu grows UP from the trigger's top edge (the composer
-              // sits at the pane's bottom — dropping down would run off-screen).
-              ...(openUp ? { bottom: '100%', marginBottom: '2px' } : { top: '100%', marginTop: '2px' }),
+              // goUp: measured on open — the menu grows UP from the trigger's
+              // top edge when opening downward would run past the window.
+              ...(goUp ? { bottom: '100%', marginBottom: '2px' } : { top: '100%', marginTop: '2px' }),
               background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
               border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
               boxShadow: '0 8px 24px rgba(0,0,0,0.35)', maxHeight: '240px', overflowY: 'auto',
@@ -859,6 +873,15 @@ function Board() {
   const [composerH, setComposerH] = useState(96)
   const composerDrag = useRef(null)
 
+  // Tabs keep the queue clean: done/failed cards live on their own tabs.
+  // Only the Queue tab is reorderable (that's the drain order).
+  const [tab, setTab] = useState('queue')
+  const tabCards = {
+    queue: q.cards.filter((c) => c.status !== 'done' && c.status !== 'failed'),
+    done: q.cards.filter((c) => c.status === 'done'),
+    failed: q.cards.filter((c) => c.status === 'failed'),
+  }
+
   const counts = {
     queued: q.cards.filter((c) => c.status === 'queued').length,
     done: q.cards.filter((c) => c.status === 'done').length,
@@ -892,33 +915,63 @@ function Board() {
               ? '⏳ waiting for model…'
               : `${counts.queued} queued · ${counts.done} done${counts.failed ? ` · ${counts.failed} failed` : ''}`,
           }),
-          counts.done > 0
+        ],
+      }),
+      // Tab row: Queue / Done / Failed — the queue stays clean.
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 0', flexShrink: 0 },
+        children: [
+          ['queue', `Queue · ${counts.queued}`],
+          ['done', `Done · ${counts.done}`],
+          ['failed', `Failed · ${counts.failed}`],
+        ].map(([k, label]) =>
+          jsx('button', {
+            key: k,
+            onClick: () => setTab(k),
+            style: {
+              border: 'none', background: 'transparent', cursor: 'pointer',
+              fontSize: '0.65rem', padding: '3px 7px', borderRadius: '4px',
+              color: tab === k ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
+              background: tab === k ? 'color-mix(in srgb, var(--ui-accent) 10%, transparent)' : 'transparent',
+              fontWeight: tab === k ? 600 : 400,
+            },
+            children: label,
+          }),
+        ),
+          tab === 'done' && counts.done > 0
             ? jsx('button', {
+                key: 'clear-done',
                 title: 'Clear done cards',
                 onClick: () => clearDone(),
-                style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.7rem', padding: '1px 4px', borderRadius: '3px' },
-                children: '✕ done',
+                style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.65rem', padding: '2px 4px', borderRadius: '3px', marginLeft: 'auto' },
+                children: '✕ clear',
               })
             : null,
-        ],
       }),
       jsx('div', {
         style: { flex: 1, overflowY: 'auto', padding: '6px', display: 'flex', flexDirection: 'column', gap: '5px' },
-        children: q.cards.length === 0
+        children: tabCards[tab].length === 0
           ? jsx('div', {
               style: { fontSize: '0.7rem', color: 'var(--ui-text-quaternary)', padding: '12px 6px', textAlign: 'center' },
-              children: 'Empty. Add a prompt below — each one runs in its own new session, visible in the sidebar.',
+              children:
+                tab === 'queue'
+                  ? 'Empty. Add a prompt below — each one runs in its own new session, visible in the sidebar.'
+                  : tab === 'done'
+                    ? 'No done cards yet.'
+                    : 'No failed cards yet.',
             })
-          : q.cards.map((c) =>
+          : tabCards[tab].map((c) =>
               jsx(CardRow, {
                 key: c.id,
                 c,
                 onDragStart: (e, id) => {
+                  if (tab !== 'queue') return
                   dragId.current = id
                   e.dataTransfer.effectAllowed = 'move'
                   try { e.dataTransfer.setData('text/plain', id) } catch { /* some runtimes */ }
                 },
                 onDropOn: (targetId) => {
+                  if (tab !== 'queue') return
                   const from = dragId.current
                   dragId.current = null
                   if (from && from !== targetId) reorderCard(from, targetId)
@@ -960,7 +1013,6 @@ function Board() {
             style: { flex: '0 0 auto', minWidth: 0 },
             children: jsx(TargetPicker, {
               value: draftTarget,
-              openUp: true,
               onSelect: (v, t) => { setDraftTarget(v); setDraftTargetTitle(t || null) },
             }),
           }),

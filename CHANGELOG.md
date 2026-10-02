@@ -53,6 +53,18 @@ while the target's turn legitimately ran **3 h 22 m** (gateway
   `+ Add`) now has a drag handle above it: drag up to enlarge the text box
   (min ~90px, max 75% of the window height) for planning longer prompts; the
   card list above shrinks/expands to match.
+- **Queue / Done / Failed tabs.** A tab row now sits above the card list;
+  `done` and `failed` cards live on their own tabs so the **Queue** tab stays
+  clean (live counts in the labels: `Queue · 3`, `Done · 12`, `Failed · 1`).
+  The old header `✕ done` moved to the Done tab as `✕ clear`. Only the Queue
+  tab is drag-reorderable (that's the drain order); Done/Failed cards keep
+  their usual retry/remove/open-session controls.
+- **Session picker opens up when it would run off the bottom of the window.**
+  `TargetPicker` now measures the trigger against the viewport on open and
+  flips the menu upward when opening downward would pass the window bottom
+  (was: always down, or hardcoded-up for the composer). The composer picker
+  — at the pane's bottom — therefore opens up; a card's picker near the top
+  still opens down.
 
 ### Migration
 
