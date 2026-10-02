@@ -157,13 +157,3 @@ Practical guidance:
 ## License
 
 [MIT](./LICENSE)
-
-## Listing (AtlasOmnia community-plugins)
-
-Listed via [PR #7](https://github.com/AtlasOmnia/community-plugins/pull/7)
-— incorporated in `48bc95a` (2026-09-30) as a directory listing, not a
-certification. The maintainer's blocking review raised three findings
-(untrusted `::enqueue` output, broken directive dedup, fail-open review
-gate); all are being addressed on the `unreleased` branch — see CHANGELOG
-(Unreleased → Planned) and the [Trust & Autonomy](#trust--autonomy) section
-above.
