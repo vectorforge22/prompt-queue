@@ -47,6 +47,13 @@ while the target's turn legitimately ran **3 h 22 m** (gateway
   a hang.
 - Target sessions are still never closed by the plugin.
 
+### UI
+
+- **Resizable composer.** The bottom block (target drop-down + text box +
+  `+ Add`) now has a drag handle above it: drag up to enlarge the text box
+  (min ~90px, max 75% of the window height) for planning longer prompts; the
+  card list above shrinks/expands to match.
+
 ### Migration
 
 - None needed. The new `queuedBehind` card flag is additive; saved queues

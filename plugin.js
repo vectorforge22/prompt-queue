@@ -851,6 +851,11 @@ function Board() {
     return () => clearInterval(t)
   }, [])
 
+  // Composer (drop-down + text box + Add) is user-resizable: a drag
+// handle above it grows/shrinks it; the card list absorbs the change.
+  const [composerH, setComposerH] = useState(96)
+  const composerDrag = useRef(null)
+
   const counts = {
     queued: q.cards.filter((c) => c.status === 'queued').length,
     done: q.cards.filter((c) => c.status === 'done').length,
@@ -918,15 +923,38 @@ function Board() {
               }),
             ),
       }),
+      jsx('div', {
+        className: 'pq-composer-handle',
+        title: 'Drag up or down to resize the composer',
+        onPointerDown: (e) => {
+          e.preventDefault()
+          composerDrag.current = { y: e.clientY, h: composerH }
+          try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* */ }
+        },
+        onPointerMove: (e) => {
+          const d = composerDrag.current
+          if (!d) return
+          let h = d.h + (d.y - e.clientY)
+          if (h < 90) h = 90
+          const max = Math.round(window.innerHeight * 0.75)
+          if (h > max) h = max
+          setComposerH(h)
+        },
+        onPointerUp: (e) => {
+          composerDrag.current = null
+          try { e.currentTarget.releasePointerCapture(e.pointerId) } catch { /* */ }
+        },
+        style: { height: '6px', flexShrink: 0, borderBottom: '1px solid var(--ui-stroke-secondary)', background: 'var(--ui-stroke-secondary)', opacity: 0.5 },
+      }),
       jsxs('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 8px', borderTop: '1px solid var(--ui-stroke-secondary)' },
+        style: { display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 8px', flexShrink: 0, minHeight: '90px', height: composerH, overflow: 'hidden' },
         children: [
           jsx(TargetPicker, {
             value: draftTarget,
             onSelect: (v, t) => { setDraftTarget(v); setDraftTargetTitle(t || null) },
           }),
           jsxs('div', {
-            style: { display: 'flex', gap: '5px', alignItems: 'flex-end' },
+            style: { display: 'flex', gap: '5px', alignItems: 'stretch', flex: 1, minHeight: '24px' },
             children: [
               jsx('textarea', {
                 placeholder: 'Add a prompt…',
@@ -935,9 +963,8 @@ function Board() {
                 onKeyDown: (e) => {
                   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit() }
                 },
-                rows: 2,
                 style: {
-                  flex: 1, fontSize: '0.7rem', resize: 'none',
+                  flex: 1, minHeight: '24px', fontSize: '0.7rem', resize: 'none', lineHeight: '1.4',
                   background: 'transparent',
                   color: 'var(--ui-text-secondary)',
                   border: '1px solid var(--ui-stroke-secondary)',
@@ -951,15 +978,14 @@ function Board() {
                   border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
                   color: draft.trim() ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
                   borderRadius: '5px', cursor: draft.trim() ? 'pointer' : 'default',
-                  fontSize: '0.7rem', padding: '4px 8px',
+                  fontSize: '0.7rem', padding: '4px 8px', alignSelf: 'flex-start',
                 },
                 children: '+ Add',
               }),
             ],
           }),
         ],
-      }),
-    ],
+      }),    ],
   })
 }
 
@@ -1032,7 +1058,9 @@ export default {
     let styleEl = null
     try {
       styleEl = document.createElement('style')
-      styleEl.textContent = '@keyframes pq-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }'
+      styleEl.textContent =
+        '@keyframes pq-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } } ' +
+        '.pq-composer-handle { cursor: ns-resize; touch-action: none; user-select: none; }'
       document.head.appendChild(styleEl)
     } catch { /* no DOM — skip */ }
 
