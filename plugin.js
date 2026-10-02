@@ -921,23 +921,24 @@ function Board() {
       jsxs('div', {
         style: { display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 0', flexShrink: 0 },
         children: [
-          ['queue', `Queue · ${counts.queued}`],
-          ['done', `Done · ${counts.done}`],
-          ['failed', `Failed · ${counts.failed}`],
-        ].map(([k, label]) =>
-          jsx('button', {
-            key: k,
-            onClick: () => setTab(k),
-            style: {
-              border: 'none', background: 'transparent', cursor: 'pointer',
-              fontSize: '0.65rem', padding: '3px 7px', borderRadius: '4px',
-              color: tab === k ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
-              background: tab === k ? 'color-mix(in srgb, var(--ui-accent) 10%, transparent)' : 'transparent',
-              fontWeight: tab === k ? 600 : 400,
-            },
-            children: label,
-          }),
-        ),
+          [
+            ['queue', `Queue · ${counts.queued}`],
+            ['done', `Done · ${counts.done}`],
+            ['failed', `Failed · ${counts.failed}`],
+          ].map(([k, label]) =>
+            jsx('button', {
+              key: k,
+              onClick: () => setTab(k),
+              style: {
+                border: 'none', background: 'transparent', cursor: 'pointer',
+                fontSize: '0.65rem', padding: '3px 7px', borderRadius: '4px',
+                color: tab === k ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
+                background: tab === k ? 'color-mix(in srgb, var(--ui-accent) 10%, transparent)' : 'transparent',
+                fontWeight: tab === k ? 600 : 400,
+              },
+              children: label,
+            }),
+          ),
           tab === 'done' && counts.done > 0
             ? jsx('button', {
                 key: 'clear-done',
@@ -947,6 +948,7 @@ function Board() {
                 children: '✕ clear',
               })
             : null,
+        ],
       }),
       jsx('div', {
         style: { flex: 1, overflowY: 'auto', padding: '6px', display: 'flex', flexDirection: 'column', gap: '5px' },
