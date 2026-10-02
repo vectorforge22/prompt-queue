@@ -593,7 +593,7 @@ function StatusDot({ status }) {
 // value undefined → trigger button ("🎯 target ▾"); value provided →
 // composer-style button showing the current choice. onSelect(value, title);
 // sessions: latest-10 with a reply + "New session" + manual session ID.
-function TargetPicker({ value, trigger, onSelect }) {
+function TargetPicker({ value, trigger, onSelect, openUp }) {
   const [open, setOpen] = useState(false)
   const [manual, setManual] = useState('')
   const [manualErr, setManualErr] = useState('')
@@ -639,7 +639,10 @@ function TargetPicker({ value, trigger, onSelect }) {
       open
         ? jsxs('div', {
             style: {
-              position: 'absolute', zIndex: 30, left: 0, right: 0, top: '100%', marginTop: '2px',
+              position: 'absolute', zIndex: 30, left: 0, right: 0,
+              // openUp: menu grows UP from the trigger's top edge (the composer
+              // sits at the pane's bottom — dropping down would run off-screen).
+              ...(openUp ? { bottom: '100%', marginBottom: '2px' } : { top: '100%', marginTop: '2px' }),
               background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
               border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
               boxShadow: '0 8px 24px rgba(0,0,0,0.35)', maxHeight: '240px', overflowY: 'auto',
@@ -947,11 +950,19 @@ function Board() {
         style: { height: '6px', flexShrink: 0, borderBottom: '1px solid var(--ui-stroke-secondary)', background: 'var(--ui-stroke-secondary)', opacity: 0.5 },
       }),
       jsxs('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 8px', flexShrink: 0, minHeight: '90px', height: composerH, overflow: 'hidden' },
+        style: { display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 8px', flexShrink: 0, minHeight: '90px', height: composerH },
         children: [
-          jsx(TargetPicker, {
-            value: draftTarget,
-            onSelect: (v, t) => { setDraftTarget(v); setDraftTargetTitle(t || null) },
+          // Non-growing wrapper: TargetPicker's root is flex:1 (for CardRow's
+          // horizontal layout) — inside the fixed-height composer block that
+          // would stretch it to half the block, gapping it from the text box
+          // and mis-anchoring its menu. Wrap so it sits at its natural height.
+          jsx('div', {
+            style: { flex: '0 0 auto', minWidth: 0 },
+            children: jsx(TargetPicker, {
+              value: draftTarget,
+              openUp: true,
+              onSelect: (v, t) => { setDraftTarget(v); setDraftTargetTitle(t || null) },
+            }),
           }),
           jsxs('div', {
             style: { display: 'flex', gap: '5px', alignItems: 'stretch', flex: 1, minHeight: '24px' },
