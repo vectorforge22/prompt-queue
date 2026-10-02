@@ -71,29 +71,37 @@ while the target's turn legitimately ran **3 h 22 m** (gateway
 - None needed. The new `queuedBehind` card flag is additive; saved queues
   from earlier versions load unchanged.
 
-### Planned (addressing the [AtlasOmnia PR #7 review](https://github.com/AtlasOmnia/community-plugins/pull/7))
+### Security hardening (addressing the [AtlasOmnia PR #7 review](https://github.com/AtlasOmnia/community-plugins/pull/7))
 
-Three findings from the blocking review are being fixed on this branch, with
-decisions locked (2026-10-02):
+All three findings from the blocking review, fixed on this branch (decisions
+locked 2026-10-02; implemented 2026-10-02):
 
 - **`::enqueue` — ask before queue (default).** Transcript-directive
   attributes are untrusted model output by platform contract
-  (`apps/desktop/src/lib/transcript-directives.ts`). The directive will add
-  a *pending* card the user clicks to accept; auto-add becomes an opt-in in
-  the pane-header gear. Also fixes the dedup bug (React strips `key`, so the
-  dedupe key was `undefined` — every second directive was silently dropped).
+  (`apps/desktop/src/lib/transcript-directives.ts`). The directive now
+  renders a "＋ add suggested prompt to queue" button — the card is added
+  only on explicit click. Auto-add is an opt-in in the gear (⚙, pane
+  header → *Suggested prompts: Auto-add*). Also **fixes the dedup bug**
+  (React strips `key`, so the old code deduped on `undefined` and silently
+  dropped every card after the first) — the identifier is now a normal
+  `dedupeKey` prop.
 - **Review gate — fail-closed default.** On `host.logs` verification
-  failure the gate will HOLD (visible "review verification unavailable"
-  state, auto-retrying) instead of releasing the next card; fail-open is
-  kept as an explicit opt-in. README/CHANGELOG "strict review gate"
-  wording is being aligned with actual semantics.
-- **Gear (pane header).** Settings: model-suggested prompts
-  (ask / auto-queue), gate behavior (fail-closed / fail-open), persisted
-  via `ctx.storage`.
+  failure the gate now **holds**: the card shows
+  `⏸ holding — review verification unavailable` and the 20 s re-poll
+  retries until absence is confirmed (a recoverable, visible state — no
+  silent release). Fail-open is an explicit opt-in (gear → *Review gate on
+  error: Open*). README/CHANGELOG "strict review gate" wording now matches
+  the implemented semantics.
+- **Gear (pane header, ⚙).** Settings: *Suggested prompts* (Ask first /
+  Auto-add) and *Review gate on error* (Hold / Open), persisted via
+  `ctx.storage` (`prompt-queue-settings-v1`) so they survive restarts.
+  Defaults are the safe side (ask / hold).
 
 Docs shipped ahead of the code (Phase 0, 2026-10-02): README **Trust &
 Autonomy** and **Performance notes (local models)** sections — including the
-KV-cache session-switch cost of one-session-per-card on local models.
+KV-cache session-switch cost of one-session-per-card on local models. The
+Trust & Autonomy section was updated to describe the shipped (not planned)
+behavior.
 
 ## 2026-09-26 — Card targets: follow-ups into existing sessions (C1)
 

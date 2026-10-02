@@ -55,6 +55,43 @@ const GLOBAL_POLL_MS = 4000 // cadence for the process-wide "any session working
 const RE_START = /(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
 const RE_DONE = /(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review complete|Background memory\/skill review failed)/
 
+// ── settings (pane-header gear) ─────────────────────────────────────────────
+// modelSuggested: 'ask' (default — ::enqueue cards need an explicit click)
+//   | 'auto' (legacy behavior: directive adds the card immediately).
+// gateFailOpen: default false (FAIL CLOSED — a review-verification error
+//   holds the queue with a visible state; true = legacy fail-open).
+// Persisted under a separate storage key so settings survive restarts.
+const SETTINGS_KEY = 'prompt-queue-settings-v1'
+let settings = { modelSuggested: 'ask', gateFailOpen: false }
+const settingsSubs = new Set()
+function useSettings() {
+  return useSyncExternalStore(
+    (cb) => { settingsSubs.add(cb); return () => settingsSubs.delete(cb) },
+    () => settings,
+    () => settings,
+  )
+}
+async function loadSettings() {
+  try {
+    if (engineCtx && engineCtx.storage) {
+      const s = await engineCtx.storage.get(SETTINGS_KEY)
+      if (s && typeof s === 'object') {
+        settings = {
+          modelSuggested: s.modelSuggested === 'auto' ? 'auto' : 'ask',
+          gateFailOpen: s.gateFailOpen === true,
+        }
+      }
+    }
+  } catch { /* defaults are the safe side */ }
+}
+function setSettings(patch) {
+  settings = { ...settings, ...patch }
+  settingsSubs.forEach((f) => f())
+  try {
+    if (engineCtx && engineCtx.storage) engineCtx.storage.set(SETTINGS_KEY, settings)
+  } catch { /* storage blip — settings reset to defaults on restart, safe side */ }
+}
+
 // ── small utils ─────────────────────────────────────────────────────────────
 function lineText(l) { return typeof l === 'string' ? l : (l && (l.line || l.message || l.text)) || '' }
 function tsOf(s) { const d = new Date(s.replace(' ', 'T')); return isNaN(d) ? null : d.getTime() }
@@ -135,16 +172,16 @@ async function reviewState() {
   return { spawn, done }
 }
 
-// Strict gate: false while ANY background review is still running (this
-// turn's or an earlier one). A log REST blip fails open (matches
-// bg-review-watch) — the 20 s re-poll retries.
+// Gate verdict: true = no review running, false = review running,
+// 'error' = could NOT verify (host.logs failed). The caller decides what
+// 'error' means via settings.gateFailOpen (default: fail closed + visible).
 async function reviewCleared() {
   try {
     const r = await reviewState()
     const active = r.spawn != null && (r.done == null || r.spawn > r.done)
     return !active
   } catch {
-    return true
+    return 'error'
   }
 }
 
@@ -428,6 +465,7 @@ function waitReview(id) {
       const t = reviewTimers.get(id)
       if (t) clearInterval(t)
       reviewTimers.delete(id)
+      patchCard(id, { holdingReview: false })
       resolve()
     }
     const check = async () => {
@@ -435,7 +473,18 @@ function waitReview(id) {
       const c = card(id)
       if (!c || c.status !== 'review-wait') return finish()
       if (Date.now() - startedAt < REVIEW_SPAWN_GRACE_MS) return
-      if (await reviewCleared()) finish()
+      const verdict = await reviewCleared()
+      if (verdict === true) return finish()
+      if (verdict === 'error') {
+        // Verification unavailable: hold by default (fail CLOSED) so a log
+        // blip can never release the next card while a review may run.
+        // The 20 s re-poll retries until absence is confirmed. Fail-open is
+        // an explicit opt-in (gear → Gate on error).
+        if (settings.gateFailOpen) return finish()
+        if (!c.holdingReview) patchCard(id, { holdingReview: true })
+        return
+      }
+      // verdict === false: a review is still running — keep waiting.
     }
     reviewTimers.set(id, setInterval(check, REVIEW_POLL_MS))
   })
@@ -589,6 +638,71 @@ function StatusDot({ status }) {
   })
 }
 
+// ── gear: plugin settings ───────────────────────────────────────────────────
+// Two autonomy knobs (Phase 3): how model-suggested (::enqueue) prompts are
+// treated, and what the review gate does when its log verification errors.
+// Both default to the SAFE side (ask / fail-closed). Persisted via ctx.storage.
+function SettingsMenu() {
+  const s = useSettings()
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+  const rowStyle = { display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 6px', fontSize: '0.68rem', color: 'var(--ui-text-secondary)' }
+  const seg = (active) => ({
+    border: '1px solid ' + (active ? 'var(--ui-accent)' : 'var(--ui-stroke-secondary)'),
+    background: active ? 'color-mix(in srgb, var(--ui-accent) 12%, transparent)' : 'transparent',
+    color: active ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)',
+    borderRadius: '4px', cursor: 'pointer', fontSize: '0.65rem', padding: '1px 7px',
+  })
+  return jsxs('div', {
+    ref,
+    style: { position: 'relative' },
+    children: [
+      jsx('button', {
+        title: 'Prompt Queue settings',
+        onClick: () => setOpen(!open),
+        style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.8rem', padding: '1px 3px', borderRadius: '3px' },
+        children: '⚙',
+      }),
+      open
+        ? jsx('div', {
+            style: {
+              position: 'absolute', zIndex: 40, top: '100%', right: 0, marginTop: '2px',
+              background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
+              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', padding: '6px', width: '250px',
+            },
+            children: [
+              jsxs('div', {
+                style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 6px 5px', borderBottom: '1px solid var(--ui-stroke-secondary)', marginBottom: '4px' },
+                children: [
+                  jsx('span', { style: { fontSize: '0.68rem', fontWeight: 600, color: 'var(--ui-text-secondary)', flex: 1 }, children: 'Suggested prompts' }),
+                  jsx('button', { onClick: () => setSettings({ modelSuggested: 'ask' }), style: seg(s.modelSuggested === 'ask'), children: 'Ask first' }),
+                  jsx('button', { onClick: () => setSettings({ modelSuggested: 'auto' }), style: seg(s.modelSuggested === 'auto'), children: 'Auto-add' }),
+                ],
+              }),
+              jsx('div', { style: { ...rowStyle, color: 'var(--ui-text-quaternary)', fontSize: '0.62rem', paddingBottom: '6px', borderBottom: '1px solid var(--ui-stroke-secondary)', marginBottom: '4px' }, children: 'A chat turn can suggest a prompt via ::enqueue (untrusted model output). “Ask first” shows a chip you click to accept; “Auto-add” queues it immediately. It only runs while Play is active.' }),
+              jsxs('div', {
+                style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 6px 5px', borderBottom: '1px solid var(--ui-stroke-secondary)', marginBottom: '4px' },
+                children: [
+                  jsx('span', { style: { fontSize: '0.68rem', fontWeight: 600, color: 'var(--ui-text-secondary)', flex: 1 }, children: 'Review gate on error' }),
+                  jsx('button', { onClick: () => setSettings({ gateFailOpen: false }), style: seg(!s.gateFailOpen), children: 'Hold' }),
+                  jsx('button', { onClick: () => setSettings({ gateFailOpen: true }), style: seg(s.gateFailOpen), children: 'Open' }),
+                ],
+              }),
+              jsx('div', { style: { ...rowStyle, color: 'var(--ui-text-quaternary)', fontSize: '0.62rem' }, children: 'If the background-review check can’t verify (log blip): “Hold” keeps the queue paused with a visible state (default, safer); “Open” proceeds and re-checks in 20 s.' }),
+            ],
+          })
+        : null,
+    ],
+  })
+}
+
 // ── C1 UI: target picker ────────────────────────────────────────────────────
 // value undefined → trigger button ("🎯 target ▾"); value provided →
 // composer-style button showing the current choice. onSelect(value, title);
@@ -732,6 +846,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
   const meta = STATUS_META[c.status] || STATUS_META.queued
   const live = c.status === 'running' || c.status === 'launching' || c.status === 'review-wait'
   const queuedInTarget = c.queuedBehind && (c.status === 'running' || c.status === 'launching')
+  const holding = c.holdingReview && c.status === 'review-wait'
   const elapsed = (c.status === 'running' || c.status === 'review-wait' || c.status === 'launching') ? Date.now() - (c.ts || Date.now()) : null
   return jsxs('div', {
     draggable: !live,
@@ -763,7 +878,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
               }),
               jsx('span', {
                 style: { fontSize: '0.625rem', color: meta.color, whiteSpace: 'nowrap', flexShrink: 0 },
-                children: (queuedInTarget ? '⏳ queued in target' : meta.label) + (elapsed != null ? ` · ${ago(elapsed)}` : ''),
+                children: (queuedInTarget ? '⏳ queued in target' : holding ? '⏸ holding — review verification unavailable' : meta.label) + (elapsed != null ? ` · ${ago(elapsed)}` : ''),
               }),
             ],
           }),
@@ -909,6 +1024,7 @@ function Board() {
             },
             children: q.playing ? '❚❚ Pause' : '▶ Play',
           }),
+          jsx(SettingsMenu, {}),
           jsx('span', {
             style: { fontSize: '0.65rem', color: q.playing && q.modelBusy ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)', marginLeft: 'auto' },
             children: q.playing && q.modelBusy
@@ -1095,20 +1211,37 @@ function Chip() {
 
 // ── ::enqueue directive ─────────────────────────────────────────────────────
 const enqueuedKeys = new Set()
-function EnqueueChip({ prompt, key }) {
+// Model-suggested prompts are UNTRUSTED INPUT (platform contract: directive
+// attributes are untrusted model output). Default 'ask': the chip renders a
+// clickable "add to queue" the user must accept. 'auto' (gear opt-in) keeps
+// the legacy immediate add. dedupeKey is a NORMAL prop — React strips `key`,
+// so the old code deduped on `undefined` and silently dropped every card
+// after the first.
+function EnqueueChip({ prompt, dedupeKey }) {
   const [phase, setPhase] = useState('pending')
   useEffect(() => {
-    if (enqueuedKeys.has(key)) { setPhase('seen'); return }
-    enqueuedKeys.add(key)
+    if (enqueuedKeys.has(dedupeKey)) { setPhase('seen'); return }
+    enqueuedKeys.add(dedupeKey)
     if (!prompt || prompt.length > 2000) { setPhase('invalid'); return }
-    addCard(prompt)
-    setPhase('added')
-  }, [key, prompt])
+    if (settings.modelSuggested === 'auto') { addCard(prompt); setPhase('added') }
+    // 'ask': stays 'pending' — the user clicks the chip to accept it.
+  }, [dedupeKey, prompt])
   const style = { color: 'var(--ui-text-quaternary)', fontSize: '0.7rem' }
+  if (phase === 'pending') {
+    return jsx('button', {
+      onClick: () => { addCard(prompt); setPhase('added') },
+      title: 'Model-suggested prompt — click to add it to the queue (it runs only while Play is active)',
+      style: {
+        border: '1px solid var(--ui-accent)', background: 'color-mix(in srgb, var(--ui-accent) 8%, transparent)',
+        color: 'var(--ui-accent)', fontSize: '0.7rem', padding: '2px 8px', borderRadius: '4px',
+        cursor: 'pointer',
+      },
+      children: '＋ add suggested prompt to queue',
+    })
+  }
   if (phase === 'added') return jsx('span', { style, children: '✓ added to prompt queue' })
   if (phase === 'seen') return jsx('span', { style, children: '✓ in prompt queue' })
-  if (phase === 'invalid') return jsx('span', { style, children: '::enqueue — prompt missing or too long (max 2000 chars)' })
-  return jsx('span', { style, children: '… adding to prompt queue' })
+  return jsx('span', { style, children: '::enqueue — prompt missing or too long (max 2000 chars)' })
 }
 
 export default {
@@ -1117,6 +1250,7 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     engineCtx = ctx
+    loadSettings()
     ensureWired()
     hydrate()
 
@@ -1154,8 +1288,9 @@ export default {
         name: 'enqueue',
         render: ({ attrs }) => {
           const prompt = attrs && attrs.prompt
-          const key = (attrs && attrs.id) || (prompt || '').slice(0, 200)
-          return jsx(EnqueueChip, { key, prompt, attrs: undefined })
+          // NORMAL prop (not `key` — React strips it, which broke dedup).
+          const dedupeKey = (attrs && attrs.id) || (prompt || '').slice(0, 200)
+          return jsx(EnqueueChip, { dedupeKey, prompt })
         },
       },
     })

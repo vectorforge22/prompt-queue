@@ -20,8 +20,10 @@ slot — while keeping every session visible in the normal sidebar.
   done (✕ done).
 - **Strict review gate** — no new prompt is fired while a background
   memory/skill review is still running (detection: `review.summary` event +
-  `thread=bg-review` log markers, 30 s spawn grace, 20 s poll, fail-open on
-  log blips).
+  `thread=bg-review` log markers, 30 s spawn grace, 20 s poll, **fail-closed
+  on log errors**: the queue holds with a visible `⏸ holding — review
+  verification unavailable` state and retries until absence is confirmed;
+  fail-open is an explicit opt-in in the gear).
 - **Slot hygiene** — after a card's turn, its one-shot session's
   active-session slot is released (`session.close`; the sidebar row stays), so a
   long queue can't exhaust the session cap.
@@ -33,9 +35,13 @@ slot — while keeping every session visible in the normal sidebar.
   frees their slot, as with any session you use).
 - **Restart-safe** — queue state persists via plugin storage; a card running
   across an app restart is re-attached (or re-queued, never dropped).
-- **`::enqueue{prompt="…"}` transcript directive** — a chat turn can add a card
-  to the queue (deduped by `id`/prompt prefix). Tell your agent the directive
-  exists; it won't discover the name on its own.
+- **`::enqueue{prompt="…"}` transcript directive** — a chat turn can
+  *suggest* a card (deduped by a real `dedupeKey` prop). Default is
+  **ask-first**: the directive renders a "＋ add suggested prompt to queue"
+  button you click to accept (the platform contract marks directive
+  attributes as untrusted model output); the gear (⚙, pane header) switches
+  it to auto-add. Tell your agent the directive exists; it won't discover
+  the name on its own.
 - **Status bar chip** — right cluster: `queue · N active, M next` /
   `queue paused · M waiting` / `queue idle`.
 
@@ -99,22 +105,20 @@ you'd queue autonomous work.
 | Source | Trust | Behavior |
 |---|---|---|
 | Textarea / picker (you typed it) | user-approved | added directly; runs only while Play is active |
-| `::enqueue{prompt="…"}` (a chat turn wrote it) | **untrusted model output** — the platform contract for transcript directives is that attributes are untrusted model output | currently: auto-adds the card; it runs only while Play is active |
+| `::enqueue{prompt="…"}` (a chat turn wrote it) | **untrusted model output** — the platform contract for transcript directives is that attributes are untrusted model output | default **ask-first**: renders a clickable chip; the card is added only when you click it (gear → *Suggested prompts: Auto-add* restores immediate add). Either way it runs only while Play is active |
 
 The `::enqueue` path is the one a prompt injection could exploit: a
 model-generated (or model-relayed, e.g. quoted from a web page or file)
-directive can place a card in the queue that you never typed yourself.
-**Mitigations in progress** (CHANGELOG, Unreleased → Planned): default
-**ask-before-queue** (the chip shows a *pending* card you click to accept),
-fixed dedup, and a pane-header gear to control the behavior. Until those
-ship, treat "Play active" as "model-suggested cards will run."
+directive can *suggest* a card you never typed yourself. By default it
+**cannot** add one on its own — the chip waits for your click — and the gear
+(⚙, pane header) is where that decision lives.
 
 **Review gate semantics.** The gate holds the queue while a background
 self-improvement review is running. If the log check itself fails (a
-transient `host.logs` blip), the current build **fails open** — it proceeds
-and the next 20 s re-poll retries. This is being hardened to **fail-closed**
-by default (hold + a visible "review verification unavailable" state), with
-fail-open kept as an explicit opt-in in the gear.
+transient `host.logs` blip), the gate **fails closed by default**: the card
+shows `⏸ holding — review verification unavailable` and the 20 s re-poll
+retries until absence is confirmed. Fail-open is an explicit opt-in
+(gear → *Review gate on error: Open*).
 
 ## Performance notes (local models)
 
