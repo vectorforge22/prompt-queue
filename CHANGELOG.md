@@ -3,7 +3,7 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
-## Unreleased (on `unreleased` branch, since 2026-10-01)
+## 1.1.0 (2026-10-02 — merged to `main`; on `unreleased` since 2026-10-01)
 
 Diagnosed against a real incident: a card targeting a research session
 (`20260925_131637_57043f`) failed with `turn stall: no completion after 1h`
@@ -76,8 +76,21 @@ while the target's turn legitimately ran **3 h 22 m** (gateway
 
 ### Migration
 
-- None needed. The new `queuedBehind` card flag is additive; saved queues
-  from earlier versions load unchanged.
+- None needed for behavior. The new `queuedBehind` card flag is additive;
+  saved queues from earlier versions load unchanged.
+
+### Catalog packaging (1.1.0 layout)
+
+- Repo restructured for the [Hermes plugin
+  catalog](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission):
+  the plugin now lives at `desktop/plugin.js` with a `plugin.yaml` manifest
+  (`requires_hermes: ">=0.21.5"`). `hermes plugins validate` passes
+  (security scan: safe; desktop surface: inside the SDK surface).
+- Disk installs must copy the `desktop/` subdirectory (see Install in the
+  README); the live install under `desktop-plugins/prompt-queue/` is
+  unaffected by the repo layout.
+- Screenshot at `docs/screenshots/prompt-queue.png` (catalog `screenshots:`
+  candidate, pinned to the listing SHA).
 
 ### Security hardening (addressing the [AtlasOmnia PR #7 review](https://github.com/AtlasOmnia/community-plugins/pull/7))
 

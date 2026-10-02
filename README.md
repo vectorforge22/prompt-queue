@@ -1,5 +1,7 @@
 # Prompt Queue — Hermes Desktop plugin
 
+![Prompt Queue pane](docs/screenshots/prompt-queue.png)
+
 Kanban-style prompt queue for the [Hermes desktop app](https://hermes-agent.nousresearch.com/docs).
 Each card is a prompt. Press **▶ Play** and the queue drains strictly top-down:
 each card becomes a **real new desktop session** (visible in the sidebar, openable
@@ -67,15 +69,22 @@ completes on the *drained* turn's completion, not the in-flight one.
 
 ## Install
 
-Renderer-only disk plugin (single ESM `plugin.js`, no build step):
+**From the catalog** (once listed in the Nous Hermes plugin catalog):
 
-1. Create a folder named `prompt-queue` under your desktop plugins dir —
-   `~/.hermes/desktop-plugins/prompt-queue/` (or
-   `$HERMES_HOME/desktop-plugins/prompt-queue/` when a profile is active).
-2. Copy this repo's `plugin.js` into it.
-3. The app hot-reloads within seconds. If it doesn't appear: ⌘K →
+```bash
+hermes plugins install prompt-queue --enable
+```
+
+**From this repo** (disk plugin; single ESM `desktop/plugin.js` + `plugin.yaml`, no build step):
+
+1. Clone the repo, then copy the `desktop/` contents into your desktop
+   plugins dir — `~/.hermes/desktop-plugins/prompt-queue/desktop/` (or
+   `$HERMES_HOME/desktop-plugins/prompt-queue/desktop/` when a profile is
+   active). The directory must end in
+   `.../prompt-queue/desktop/plugin.js`.
+2. The app hot-reloads within seconds. If it doesn't appear: ⌘K →
    **Reload desktop plugins**. A load failure shows a toast naming the error.
-4. Manage (enable/disable) in **Settings → Plugins**.
+3. Manage (enable/disable) in **Settings → Plugins**.
 
 ## Requirements
 
