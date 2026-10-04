@@ -2,7 +2,7 @@
 
 > Draft, 2026-10-02. Paste into the catalog PR body. **Not submitted.**
 > Entry file: `plugin-catalog/prompt-queue.yaml` (this repo, `docs/catalog-submission/`).
-> Pin: `4851cd1f9e41d1d7be30c82ae641b7d3fdec055c` (main, v1.1.0).
+> Pin: `da41ee7da408afd68e9e26aabb6f157b9fa24481` (main, v1.1.0).
 
 ---
 
