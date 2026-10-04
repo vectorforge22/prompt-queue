@@ -3,6 +3,39 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.1.1 (2026-10-03 — catalog review fixes)
+
+Addressing the Nous catalog review of `4851cd1` (PR #131983, "needs changes
+before listing" — two Medium findings + two smaller notes).
+
+### Fixed
+
+- **The ask-first chip now shows what it is asking about.** The `::enqueue`
+  chip used to render only the fixed text "＋ add suggested prompt to
+  queue" (with a generic tooltip), while replacing the directive paragraph —
+  so the suggested prompt was never visible, and in auto mode the card could
+  launch as a full agent turn seconds after a blind click. The chip now
+  renders the prompt itself, truncated at ~200 chars, with the full prompt
+  in the tooltip.
+- **Auto-add no longer re-queues old transcripts after a reload.** The
+  de-dupe set was in-memory only, so reloading the app with Auto-add on
+  re-added every `::enqueue` in an old transcript (and ran them if Play was
+  on). Auto-add now fires only on first mount while the message is still
+  streaming (`streaming === true` from the directive render props); settled
+  re-renders show the chip again (ask) or nothing (auto, already added)
+  without re-adding.
+- **`Tip` rendered as a string.** The target-follow-up label used
+  `jsxs('Tip', …)` — a string tag — so the tooltip never worked. Now uses
+  the imported `Tip` component.
+- **Stall error text derived from the constant.** The "turn stall: no
+  completion after 1h" message was hardcoded while `TURN_STALL_MS` is 12 h;
+  it now computes the hours from the constant.
+
+### Migration
+
+- None. Storage format unchanged; existing queues and settings load as-is.
+  In-memory de-dupe semantics unchanged for the live session.
+
 ## 1.1.0 (2026-10-02 — merged to `main`; on `unreleased` since 2026-10-01)
 
 Diagnosed against a real incident: a card targeting a research session

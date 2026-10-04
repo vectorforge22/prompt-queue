@@ -1,5 +1,5 @@
 name: prompt-queue
-version: 1.1.0
+version: 1.1.1
 description: "Kanban-style prompt queue for the Hermes desktop app: Play drains cards one at a time, each into a new (or targeted, existing) sidebar session, gated on the global model slot and background-review completion. Queue/Done/Skipped/Failed tabs, resizable composer, per-card target picker, and a trust-aware ::enqueue directive (ask-first by default)."
 author: "@vectorforge22"
 requires_hermes: ">=0.21.5"

@@ -610,7 +610,7 @@ async function hydrate() {
           waitTurn(c.id, c.sid).then((ok) => {
             const cur = card(c.id)
             if (!cur || cur.status !== 'running') return
-            if (!ok) { patchCard(c.id, { status: 'failed', err: 'turn stall: no completion after 1h (session left open)', ts: Date.now() }); return }
+            if (!ok) { patchCard(c.id, { status: 'failed', err: `turn stall: no completion after ${Math.round(TURN_STALL_MS / 3600000)}h (session left open)`, ts: Date.now() }); return }
             patchCard(c.id, { status: 'review-wait', ts: Date.now() })
             waitReview(c.id).then(() => {
               const cur2 = card(c.id)
@@ -953,7 +953,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
                     onSelect: (v, t) => patchCard(c.id, { target: v, targetTitle: t || null }),
                   }),
                   c.target && c.target !== 'new'
-                    ? jsxs('Tip', {
+                    ? jsxs(Tip, {
                         label: `Follow-up into: ${c.targetTitle || c.target}`,
                         children: jsx('span', {
                           style: {
@@ -1285,29 +1285,36 @@ const enqueuedKeys = new Set()
 // Model-suggested prompts are UNTRUSTED INPUT (platform contract: directive
 // attributes are untrusted model output). Default 'ask': the chip renders a
 // clickable "add to queue" the user must accept. 'auto' (gear opt-in) keeps
-// the legacy immediate add. dedupeKey is a NORMAL prop — React strips `key`,
-// so the old code deduped on `undefined` and silently dropped every card
-// after the first.
-function EnqueueChip({ prompt, dedupeKey }) {
+// the legacy immediate add — but ONLY on the first mount while the message
+// is still streaming (a reload re-renders old transcripts settled; those
+// must never re-queue, even with auto-add on). dedupeKey is a NORMAL prop —
+// React strips `key`, so the old code deduped on `undefined` and silently
+// dropped every card after the first.
+function EnqueueChip({ prompt, dedupeKey, streaming }) {
   const [phase, setPhase] = useState('pending')
   useEffect(() => {
     if (enqueuedKeys.has(dedupeKey)) { setPhase('seen'); return }
     enqueuedKeys.add(dedupeKey)
     if (!prompt || prompt.length > 2000) { setPhase('invalid'); return }
-    if (settings.modelSuggested === 'auto') { addCard(prompt); setPhase('added') }
+    if (streaming && settings.modelSuggested === 'auto') { addCard(prompt); setPhase('added') }
     // 'ask': stays 'pending' — the user clicks the chip to accept it.
+    // 'auto' on a settled re-render (reload/scroll-back): stays 'pending'
+    // too — showing the chip again is safe; re-adding is not.
   }, [dedupeKey, prompt])
+  const preview = (prompt || '').length > 200
+    ? (prompt || '').slice(0, 200) + '…'
+    : (prompt || '')
   const style = { color: 'var(--ui-text-quaternary)', fontSize: '0.7rem' }
   if (phase === 'pending') {
     return jsx('button', {
       onClick: () => { addCard(prompt); setPhase('added') },
-      title: 'Model-suggested prompt — click to add it to the queue (it runs only while Play is active)',
+      title: 'Model-suggested prompt (untrusted model output) — click to add it to the queue (it runs only while Play is active):\n' + (prompt || ''),
       style: {
         border: '1px solid var(--ui-accent)', background: 'color-mix(in srgb, var(--ui-accent) 8%, transparent)',
         color: 'var(--ui-accent)', fontSize: '0.7rem', padding: '2px 8px', borderRadius: '4px',
-        cursor: 'pointer',
+        cursor: 'pointer', textAlign: 'left',
       },
-      children: '＋ add suggested prompt to queue',
+      children: '＋ ' + preview,
     })
   }
   if (phase === 'added') return jsx('span', { style, children: '✓ added to prompt queue' })
@@ -1319,9 +1326,11 @@ export default {
   id: 'prompt-queue',
   name: 'Prompt Queue',
   defaultEnabled: true,
-  register(ctx) {
+  async register(ctx) {
     engineCtx = ctx
-    loadSettings()
+    // AWAIT: a directive can mount before storage resolves; auto-add must
+    // not run against default settings (ask) when the user has 'auto' saved.
+    await loadSettings()
     ensureWired()
     hydrate()
 
@@ -1357,11 +1366,14 @@ export default {
       area: TRANSCRIPT_DIRECTIVE_AREA,
       data: {
         name: 'enqueue',
-        render: ({ attrs }) => {
+        render: ({ attrs, streaming }) => {
           const prompt = attrs && attrs.prompt
           // NORMAL prop (not `key` — React strips it, which broke dedup).
           const dedupeKey = (attrs && attrs.id) || (prompt || '').slice(0, 200)
-          return jsx(EnqueueChip, { dedupeKey, prompt })
+          // streaming: true only while the message is still being generated —
+          // the gate that lets auto-add fire once, never on old-transcript
+          // re-renders after a reload.
+          return jsx(EnqueueChip, { dedupeKey, prompt, streaming: !!streaming })
         },
       },
     })

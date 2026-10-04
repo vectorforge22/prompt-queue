@@ -44,11 +44,13 @@ slot — while keeping every session visible in the normal sidebar.
   across an app restart is re-attached (or re-queued, never dropped).
 - **`::enqueue{prompt="…"}` transcript directive** — a chat turn can
   *suggest* a card (deduped by a real `dedupeKey` prop). Default is
-  **ask-first**: the directive renders a "＋ add suggested prompt to queue"
-  button you click to accept (the platform contract marks directive
-  attributes as untrusted model output); the gear (⚙, pane header) switches
-  it to auto-add. Tell your agent the directive exists; it won't discover
-  the name on its own.
+  **ask-first**: the directive renders a chip showing the suggested prompt
+  itself (truncated ~200 chars; full text in the tooltip) that you click to
+  accept (the platform contract marks directive attributes as untrusted
+  model output); the gear (⚙, pane header) switches it to auto-add.
+  Auto-add only fires while the message is still streaming — re-rendering an
+  old transcript after a reload never re-queues its directives. Tell your
+  agent the directive exists; it won't discover the name on its own.
 - **Status bar chip** — right cluster: `queue · N active, M next` /
   `queue paused · M waiting` / `queue idle`.
 
