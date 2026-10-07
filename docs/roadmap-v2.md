@@ -1,9 +1,19 @@
 # Prompt Queue — Roadmap v2 (feature assessment + phase plan)
 
 Status: **assessment** (2026-10-07). Branch `roadmap`, base `main` @ v1.1.1.
+Catalog PR #131983 **merged** (2026-10-07) — v1.1.1 is the published pin.
 Every gateway primitive below was verified in `tui_gateway/` source (checkout
 `C:\Users\Arthur\AppData\Local\hermes\hermes-agent`), not taken on faith from
 docs.
+
+## Phase status
+
+- **Phase 1 (Project targeting) — IMPLEMENTED 2026-10-07** (v1.2.0 on
+  `roadmap`): `project:<id>` + `project:new:<path>` targets in the picker,
+  `projects.list`/`projects.create` RPCs, `session.create {cwd}`, idempotent
+  create with card re-anchoring, storage payload v2 (same key — live queues
+  survive). Pending: Arthur's real-run eyeball (pick a project target,
+  Play, confirm the session lands under the project in the sidebar).
 
 ## Feature feasibility (verified against source)
 

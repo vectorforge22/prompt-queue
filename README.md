@@ -34,12 +34,18 @@ slot — while keeping every session visible in the normal sidebar.
 - **Slot hygiene** — after a card's turn, its one-shot session's
   active-session slot is released (`session.close`; the sidebar row stays), so a
   long queue can't exhaust the session cap.
-- **Card targets** — each card can run into a **new session** (default) or
-  an **existing session**: pick from the latest 10 sessions with a reply, or
-  paste a session ID. Set at add time or per-card (`🎯 target ▾`); a queued
-  card can be repointed before it fires. Target cards attach via
-  `session.resume` and are **never closed** by the plugin (the idle reaper
-  frees their slot, as with any session you use).
+- **Card targets** — each card can run into a **new session** (default),
+  an **existing session** (picker of the latest 10 with a reply, or paste a
+  session ID), or a **project** (`📁`): the picker's Project section lists
+  the active profile's projects and a **＋ New project…** form (name +
+  folder path). A project card always runs in a *fresh* session whose cwd
+  is the project's primary path, so the session appears under that project
+  in the sidebar; a "new project" card creates it first (idempotently — a
+  retry or a second card on the same folder reuses it). Set at add time or
+  per-card (`🎯 target ▾`); a queued card can be repointed before it fires.
+  Session targets attach via `session.resume` and are **never closed** by
+  the plugin (the idle reaper frees their slot, as with any session you
+  use); project sessions are one-shots and are closed after their turn.
 - **Restart-safe** — queue state persists via plugin storage; a card running
   across an app restart is re-attached (or re-queued, never dropped).
 - **`::enqueue{prompt="…"}` transcript directive** — a chat turn can

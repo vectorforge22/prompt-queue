@@ -3,6 +3,54 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.2.0 (2026-10-07 — project targeting, roadmap Phase 1)
+
+Cards can now run into **desktop Projects** (the sidebar's named workspaces).
+
+### Added
+
+- **Project targets in the target picker** — the 🎯 picker (composer and
+  per-card) gained a **Project** section between "New session" and the
+  session list: every non-archived project of the active profile
+  (`projects.list` RPC), plus **＋ New project…** with an inline form
+  (name optional — defaults to the folder's name — and a folder path that
+  must exist on the gateway host).
+- **`project:<id>` target** — the card creates a FRESH session with
+  `cwd = project.primary_path` (`session.create` accepts `cwd`; the sidebar
+  groups a session under the project that owns its cwd, per
+  `hermes_cli.projects_db.project_for_path`). The session is closed after
+  its turn like any one-shot card; the project itself is never touched.
+- **`project:new:<path>` target** — at fire time the plugin calls
+  `projects.create` (name + folder, `primary_path` = the given path), then
+  runs the card in it. The card is immediately re-anchored to the created
+  project's real id (`project:<id>`), so a retry never re-creates it — and
+  a second card pointed at the same folder reuses it too (idempotent
+  create: a matching primary path is adopted, avoiding the gateway's 5063
+  duplicate-primary-path refusal).
+- **Per-project error states** — clean `failed` reasons when a target
+  project is gone (deleted/archived) or has no folder, or the new-project
+  path was never set.
+
+### Unchanged
+
+- **Existing targeting is untouched**: `new` (default) and session-key
+  targets behave exactly as before; v1 card storage loads unchanged
+  (cards simply have no `project:` target). The storage key is unchanged;
+  the payload version bumped 1 → 2.
+- **The engine is otherwise identical**: global model-slot gate, strict
+  review gate, queued-in-target tracking, 12 h stall backstop, restart
+  re-attach. Project cards are "new session" cards for every gate and
+  close-on-done decision — the only difference is the `cwd` on
+  `session.create`.
+
+### Notes
+
+- Projects are per-profile: the picker lists the ACTIVE profile's
+  projects (the same `projects.db` the sidebar shows). Switch profile →
+  different list; cards keep their stored id either way.
+- A project session inherits the project's git context (branch/root)
+  automatically, since that derives from the cwd at create time.
+
 ## 1.1.1 (2026-10-03 — catalog review fixes)
 
 Addressing the Nous catalog review of `4851cd1` (PR #131983, "needs changes

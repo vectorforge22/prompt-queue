@@ -23,9 +23,15 @@
 // Renderer-only disk plugin (loaded uncompiled): only @hermes/plugin-sdk /
 // react / react/jsx-runtime resolve. UI is written with jsx() calls.
 //
-// State: ctx.storage JSON ({v, cards, playing}). Card:
-//   { id, text, title, status, sid?, stored?, err?, ts, doneAt? }
+// State: ctx.storage JSON ({v, cards, playing}) — schema v2. Card:
+//   { id, text, title, status, sid?, stored?, err?, ts, doneAt?,
+//     target?, targetTitle?, projectName? }
 //   status: queued | launching | running | review-wait | done | failed
+//   target: 'new' (default, fresh session) | a session key (follow-up)
+//           | 'project:<id>' (fresh session under an existing desktop
+//             project: session.create cwd = project primary path)
+//           | 'project:new:<path>' (projects.create first, then the same;
+//             the card is re-anchored to the created id at fire time)
 //
 // Review gate (lifted from bg-review-watch): at most one background review
 // runs at a time; running ⇔ latest spawn ts > latest completion ts.
@@ -39,6 +45,9 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 import { useSyncExternalStore, useState, useEffect, useRef, Fragment } from 'react'
 
 // ── constants ───────────────────────────────────────────────────────────────
+// Schema v2 (cards gained project targeting) lives under the SAME storage key
+// as v1 — hydrate() must find the old key or a live queue would vanish on a
+// plugin update. Cards without project fields load and behave exactly as v1.
 const STORE_KEY = 'prompt-queue-state-v1'
 const REVIEW_POLL_MS = 20000
 const TURN_FALLBACK_POLL_MS = 10000
@@ -136,7 +145,7 @@ function persist() {
     persistTimer = null
     try {
       if (engineCtx && engineCtx.storage) {
-        await engineCtx.storage.set(STORE_KEY, { v: 1, cards: state.cards, playing: false })
+        await engineCtx.storage.set(STORE_KEY, { v: 2, cards: state.cards, playing: false })
       }
     } catch { /* storage blip — retried on the next transition */ }
   }, 400)
@@ -261,6 +270,49 @@ async function refreshSessionList(force) {
 }
 function pickerSessions() { return sessionCache.list.slice(0, PICKER_SHOW) }
 
+// ── project targeting (Phase 1) ─────────────────────────────────────────────
+// A card can also run into a DESKTOP PROJECT: 'project:<id>' targets an
+// existing project (a fresh session is created with cwd = the project's
+// primary path — the sidebar groups a session by its cwd), and
+// 'project:new:<path>' creates the project first, then targets it.
+// projects.* RPCs are profile-scoped (tui_gateway/methods_projects.py); the
+// plugin's host.request hits the active profile's backend, the same one
+// session.create uses — same profile, same projects.db.
+const PROJECT_TARGET_PREFIX = 'project:'
+const NEW_PROJECT_PREFIX = 'project:new:'
+let projectCache = { at: 0, list: [] }
+const PROJECT_LIST_REFRESH_MS = 30000
+
+async function refreshProjectList(force) {
+  const now = Date.now()
+  if (!force && projectCache.list.length && now - projectCache.at < PROJECT_LIST_REFRESH_MS) {
+    return projectCache.list
+  }
+  try {
+    const res = await host.request('projects.list', {})
+    const rows = (res && res.projects) || []
+    projectCache = {
+      at: now,
+      list: rows
+        .filter((p) => p && !p.archived)
+        .map((p) => ({ id: p.id, name: p.name, path: p.primary_path || (p.folders && p.folders[0] && p.folders[0].path) || '' }))
+        .sort((a, b) => (a.name || '').localeCompare(b.name || '')),
+    }
+  } catch {
+    /* keep the stale cache (or empty) — fail-open, like the session picker */
+  }
+  return projectCache.list
+}
+function projectOf(target) {
+  if (typeof target !== 'string' || !target.startsWith(PROJECT_TARGET_PREFIX)) return null
+  return target === NEW_PROJECT_PREFIX ? { id: null, path: '' } : { id: target.slice(PROJECT_TARGET_PREFIX.length) }
+}
+function projectTitle(c) {
+  const t = (c && c.target) || ''
+  if ((c && c.targetTitle) && t !== NEW_PROJECT_PREFIX) return c.targetTitle
+  return t === NEW_PROJECT_PREFIX ? '(new project)' : t
+}
+
 // ── engine ──────────────────────────────────────────────────────────────────
 let inFlight = 0
 const turnTimers = new Map()   // card id → { interval, timeout }
@@ -324,13 +376,69 @@ async function runCard(id) {
     if (v2 === 'paused') return
   }
   patchCard(id, { status: 'launching', ts: Date.now(), err: null })
-  const isNew = !c.target || c.target === 'new'
+  // Project targets are ALWAYS fresh sessions (created under the project's
+  // cwd) — they must not fall into the session.resume branch below.
+  const isProject = !!projectOf(c.target)
+  const isNew = !c.target || c.target === 'new' || isProject
+  // Phase 1: project targets — 'project:<id>' runs a fresh session inside an
+  // existing project; 'project:new:<path>' creates the project first.
+  let createCwd = null
+  if (isProject) {
+    const ref = projectOf(c.target)
+    const list = await refreshProjectList(true)
+    if (ref.id) {
+      const proj = list.find((p) => p.id === ref.id)
+      if (!proj) {
+        patchCard(id, { status: 'failed', err: `project "${c.targetTitle || ref.id}" not found (deleted or archived?)`, ts: Date.now() })
+        return
+      }
+      if (!proj.path) {
+        patchCard(id, { status: 'failed', err: `project "${proj.name}" has no folder — add one in the sidebar, then retry`, ts: Date.now() })
+        return
+      }
+      createCwd = proj.path
+    } else {
+      const rawPath = String(c.target.slice(NEW_PROJECT_PREFIX.length) || '').trim()
+      if (!rawPath) {
+        patchCard(id, { status: 'failed', err: 'new project: no folder path set on the card', ts: Date.now() })
+        return
+      }
+      const name = (c.projectName || '').trim() || rawPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      // Idempotent create: a card whose project was already minted (e.g. a
+      // failed session.create after a successful projects.create, then retry)
+      // reuses the existing project instead of hitting 5063 (duplicate
+      // primary path).
+      const dupe = list.find((p) => p.path && p.path.toLowerCase() === rawPath.toLowerCase())
+      let createdProj = dupe || null
+      if (!createdProj) {
+        try {
+          const res = await host.request('projects.create', { name, primary_path: rawPath, folders: [rawPath] })
+          createdProj = res && res.project
+        } catch (e) {
+          patchCard(id, { status: 'failed', err: 'projects.create: ' + errMsg(e), ts: Date.now() })
+          return
+        }
+        if (!createdProj || !createdProj.id) {
+          patchCard(id, { status: 'failed', err: 'projects.create returned no project', ts: Date.now() })
+          return
+        }
+      }
+      // Anchor the card to the REAL project (id + resolved primary path) so a
+      // retry — or a second card re-pointed at it — doesn't re-create.
+      patchCard(id, {
+        target: PROJECT_TARGET_PREFIX + createdProj.id,
+        targetTitle: createdProj.name,
+        projectName: name,
+      })
+      createCwd = createdProj.primary_path || rawPath
+    }
+  }
   let sid
   let stored
   if (isNew) {
     let created
     try {
-      created = await host.request('session.create', { title: c.title })
+      created = await host.request('session.create', { title: c.title, ...(createCwd ? { cwd: createCwd } : {}) })
     } catch (e) {
       patchCard(id, { status: 'failed', err: 'session.create: ' + errMsg(e), ts: Date.now() })
       return
@@ -767,14 +875,19 @@ function SettingsMenu() {
 
 // ── C1 UI: target picker ────────────────────────────────────────────────────
 // value undefined → trigger button ("🎯 target ▾"); value provided →
-// composer-style button showing the current choice. onSelect(value, title);
-// sessions: latest-10 with a reply + "New session" + manual session ID.
+// composer-style button showing the current choice. onSelect(value, title).
+// Sections: New session / Projects (existing + "New project…" inline form) /
+// sessions (latest 10 with a reply) / manual session ID.
 function TargetPicker({ value, trigger, onSelect }) {
   const [open, setOpen] = useState(false)
   const [goUp, setGoUp] = useState(false)
   const [manual, setManual] = useState('')
   const [manualErr, setManualErr] = useState('')
   const [sessions, setSessions] = useState(pickerSessions())
+  const [projects, setProjects] = useState(projectCache.list)
+  const [newProj, setNewProj] = useState(false)
+  const [projName, setProjName] = useState('')
+  const [projPath, setProjPath] = useState('')
   const boxRef = useRef(null)
   // On open: measure the trigger against the viewport and flip the menu
   // upward when it would run past the bottom of the window. This is why the
@@ -792,6 +905,7 @@ function TargetPicker({ value, trigger, onSelect }) {
   useEffect(() => {
     if (!open) return
     refreshSessionList(true).then((list) => setSessions(list.slice(0, PICKER_SHOW)))
+    refreshProjectList(true).then((list) => setProjects(list))
     return undefined
   }, [open])
   useEffect(() => {
@@ -802,9 +916,20 @@ function TargetPicker({ value, trigger, onSelect }) {
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
   }, [open])
-  const currentTitle = value === 'new' ? 'New session' : (sessions.find((s) => s.id === value) || {}).title || value
+  const projRef = projectOf(value)
+  const currentTitle = value === 'new' ? 'New session'
+    : projRef ? (projectTitle({ target: value, targetTitle: projRef.id ? value : null }) || value)
+    : (sessions.find((s) => s.id === value) || {}).title || value
   const pick = (v, title) => { onSelect(v, title); setOpen(false) }
-  const btnLabel = trigger || (value === undefined ? '🎯 target' : (value === 'new' ? '🎯 New session' : `🎯 → ${currentTitle}`))
+  const submitNewProject = () => {
+    const path = projPath.trim()
+    if (!path) return
+    pick(NEW_PROJECT_PREFIX + path, projName.trim())
+    setNewProj(false); setProjName(''); setProjPath('')
+  }
+  const btnLabel = trigger || (value === undefined ? '🎯 target' : (value === 'new' ? '🎯 New session' : `🎯 ${projRef ? '📁 ' : '→ '}${currentTitle}`))
+  const rowStyle = { padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
+  const sectionLabel = '— '
   return jsxs('div', {
     ref: boxRef,
     style: { position: 'relative', flex: trigger ? 'none' : 1 },
@@ -835,16 +960,89 @@ function TargetPicker({ value, trigger, onSelect }) {
               ...(goUp ? { bottom: '100%', marginBottom: '2px' } : { top: '100%', marginTop: '2px' }),
               background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
               border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
-              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', maxHeight: '240px', overflowY: 'auto',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', maxHeight: '280px', overflowY: 'auto',
             },
             children: [
               jsxs('div', {
                 onClick: () => pick('new', null),
-                style: { padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer', color: value === 'new' ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: value === 'new' ? 600 : 400 },
+                style: { ...rowStyle, color: value === 'new' ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: value === 'new' ? 600 : 400 },
                 children: ['＋ New session'],
               }),
+              jsxs('div', {
+                style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
+                children: [sectionLabel, 'Project', sectionLabel],
+              }),
+              projects.length === 0
+                ? jsx('div', { style: { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No projects yet' })
+                : projects.map((p) =>
+                    jsxs('div', {
+                      key: p.id,
+                      title: p.path || p.name,
+                      onClick: () => pick(PROJECT_TARGET_PREFIX + p.id, p.name),
+                      style: {
+                        ...rowStyle,
+                        color: projRef && projRef.id === p.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
+                        fontWeight: projRef && projRef.id === p.id ? 600 : 400,
+                      },
+                      children: ['📁 ', p.name],
+                    }),
+                  ),
+              jsxs('div', {
+                onClick: () => setNewProj(!newProj),
+                style: { ...rowStyle, color: 'var(--ui-text-secondary)' },
+                children: [newProj ? '▾ ' : '＋ ', 'New project…'],
+              }),
+              newProj
+                ? jsxs('div', {
+                    style: { display: 'flex', flexDirection: 'column', gap: '4px', padding: '4px 9px 6px' },
+                    children: [
+                      jsx('input', {
+                        value: projName,
+                        onChange: (e) => setProjName(e.target.value),
+                        placeholder: 'Name (optional — defaults to the folder name)',
+                        style: {
+                          width: '100%', fontSize: '0.65rem', padding: '3px 6px',
+                          border: '1px solid var(--ui-stroke-secondary)', borderRadius: '4px',
+                          background: 'transparent', color: 'var(--ui-text-secondary)', boxSizing: 'border-box',
+                        },
+                      }),
+                      jsxs('div', {
+                        style: { display: 'flex', gap: '4px' },
+                        children: [
+                          jsx('input', {
+                            value: projPath,
+                            onChange: (e) => setProjPath(e.target.value),
+                            onKeyDown: (e) => { if (e.key === 'Enter') submitNewProject() },
+                            placeholder: '…/folder path (must exist)',
+                            style: {
+                              flex: 1, minWidth: 0, fontSize: '0.65rem', padding: '3px 6px',
+                              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '4px',
+                              background: 'transparent', color: 'var(--ui-text-secondary)',
+                            },
+                          }),
+                          jsx('button', {
+                            type: 'button',
+                            onClick: submitNewProject,
+                            disabled: !projPath.trim(),
+                            style: {
+                              border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
+                              color: projPath.trim() ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
+                              fontSize: '0.65rem', borderRadius: '4px', padding: '3px 7px',
+                              cursor: projPath.trim() ? 'pointer' : 'default',
+                            },
+                            children: 'Create',
+                          }),
+                        ],
+                      }),
+                    ],
+                  })
+                : null,
+              jsxs('div', {
+                style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
+                children: [sectionLabel, 'Session', sectionLabel],
+              }),
               sessions.length === 0
-                ? jsx('div', { style: { padding: '5px 9px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No sessions with a reply yet' })
+                ? jsx('div', { style: { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No sessions with a reply yet' })
                 : null,
               sessions.map((s) =>
                 jsxs('div', {
@@ -852,10 +1050,9 @@ function TargetPicker({ value, trigger, onSelect }) {
                   title: s.id,
                   onClick: () => pick(s.id, s.title),
                   style: {
-                    padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer',
+                    ...rowStyle,
                     color: value === s.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
                     fontWeight: value === s.id ? 600 : 400,
-                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                   },
                   children: [s.title],
                 }),
@@ -954,14 +1151,16 @@ function CardRow({ c, onDragStart, onDropOn }) {
                   }),
                   c.target && c.target !== 'new'
                     ? jsxs(Tip, {
-                        label: `Follow-up into: ${c.targetTitle || c.target}`,
+                        label: projectOf(c.target)
+                          ? `Runs in a fresh session under project: ${projectTitle(c)}`
+                          : `Follow-up into: ${c.targetTitle || c.target}`,
                         children: jsx('span', {
                           style: {
                             fontSize: '0.625rem', color: 'var(--ui-text-quaternary)',
                             whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                             maxWidth: '110px', flexShrink: 1,
                           },
-                          children: `→ ${c.targetTitle || c.target}`,
+                          children: `${projectOf(c.target) ? '📁' : '→'} ${projectTitle(c)}`,
                         }),
                       })
                     : null,
