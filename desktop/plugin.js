@@ -613,6 +613,9 @@ function addCard(text, target, targetTitle) {
     cards: [...state.cards, {
       id: uid(), text: t, title: sanitizeTitle(t), status: 'queued', ts: Date.now(),
       target: target || 'new', targetTitle: targetTitle || null,
+      // 'New project…' passes the typed name via targetTitle — keep a copy
+      // under its own field so the engine can name the project it mints.
+      projectName: (target || '').startsWith(NEW_PROJECT_PREFIX) ? (targetTitle || null) : null,
     }],
   })
 }
@@ -1147,7 +1150,10 @@ function CardRow({ c, onDragStart, onDropOn }) {
                 children: [
                   jsx(TargetPicker, {
                     trigger: '🎯 target ▾',
-                    onSelect: (v, t) => patchCard(c.id, { target: v, targetTitle: t || null }),
+                    onSelect: (v, t) => patchCard(c.id, {
+                      target: v, targetTitle: t || null,
+                      projectName: (v || '').startsWith(NEW_PROJECT_PREFIX) ? (t || null) : null,
+                    }),
                   }),
                   c.target && c.target !== 'new'
                     ? jsxs(Tip, {
