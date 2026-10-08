@@ -58,6 +58,15 @@ const TURN_FALLBACK_POLL_MS = 10000
 // poll, so this only trips on genuinely hung sessions.
 const TURN_STALL_MS = 12 * 60 * 60 * 1000
 const REVIEW_SPAWN_GRACE_MS = 30000 // reviews fork AFTER the turn ends; wait this long before accepting "none spawned"
+// Last-resort review-gate backstop: a card may sit in 'review-wait' at most
+// this long. The 20s log poll is the real detector; this only fires when the
+// in-memory poll timer was lost (pane unmount/hot-reload) and the card would
+// otherwise hold the lane forever with the review long finished. On fire it
+// re-checks the log: a CONFIRMED-absent review releases the card; a still-
+// running review fails the card with a retry hint instead of hanging.
+// 3h >> any observed review (longest ~2h) and matches the TURN_STALL_MS
+// order of magnitude.
+const REVIEW_STALL_MS = 3 * 60 * 60 * 1000
 const CLOSE_AFTER_DONE_MS = 3000
 const SUBMIT_RETRIES = 3
 const GLOBAL_POLL_MS = 4000 // cadence for the process-wide "any session working" gate
@@ -516,8 +525,10 @@ async function runCard(id) {
     return // don't close a session that may still be working
   }
 
-  // 4 — strict review gate (reviews fork AFTER the turn ends)
-  patchCard(id, { status: 'review-wait', ts: Date.now() })
+  // 4 — strict review gate (reviews fork AFTER the turn ends).
+  // reviewWaitSince is persisted so a remount/backstop measures from here,
+  // not from a later timer rebuild.
+  patchCard(id, { status: 'review-wait', reviewWaitSince: Date.now(), ts: Date.now() })
   await waitReview(id)
   const cur2 = card(id)
   if (!cur2 || cur2.status === 'failed') return
@@ -580,17 +591,21 @@ function waitTurn(id, sid) {
 }
 
 // Resolves once no background review is running, after the spawn grace.
+// reviewWaitSince is persisted on the card (not just a local startedAt) so a
+// pane remount that rebuilds this timer — or the REVIEW_STALL_MS backstop —
+// measures from the ORIGINAL wait start, not the remount.
 function waitReview(id) {
   return new Promise((resolve) => {
     let settled = false
-    const startedAt = Date.now()
+    const c0 = card(id)
+    const startedAt = (c0 && c0.reviewWaitSince) || Date.now()
     const finish = () => {
       if (settled) return
       settled = true
       const t = reviewTimers.get(id)
       if (t) clearInterval(t)
       reviewTimers.delete(id)
-      patchCard(id, { holdingReview: false })
+      patchCard(id, { holdingReview: false, reviewWaitSince: null })
       resolve()
     }
     const check = async () => {
@@ -609,7 +624,18 @@ function waitReview(id) {
         if (!c.holdingReview) patchCard(id, { holdingReview: true })
         return
       }
-      // verdict === false: a review is still running — keep waiting.
+      // verdict === false: a review is still running — keep waiting, unless
+      // we've been here past the backstop, in which case the review itself is
+      // the anomaly (no review has ever run this long): fail with a hint
+      // instead of holding the lane forever.
+      if (Date.now() - startedAt > REVIEW_STALL_MS) {
+        patchCard(id, {
+          status: 'failed', holdingReview: false, reviewWaitSince: null,
+          err: `review gate: a review is STILL running after ${Math.round(REVIEW_STALL_MS / 3600000)}h (none has ever run that long) — check the session, then retry`,
+          ts: Date.now(),
+        })
+        return finish()
+      }
     }
     reviewTimers.set(id, setInterval(check, REVIEW_POLL_MS))
   })
@@ -705,6 +731,44 @@ function retryCard(id) {
   patchCard(id, { status: 'queued', err: null, sid: null, stored: null, ts: Date.now() })
   if (!state.playing) setTimeout(pump, 50)
 }
+// Manual escape hatch for a wedged 'review-wait' card (lost gate timer, a
+// review that never logged completion, a mis-parsed marker). The work is
+// done — the turn completed before the card entered the gate — so force-done
+// is safe. Closes the one-shot session's slot like the normal done path
+// (stored === sid means the queue created it; target sessions are never
+// closed). The auto sweep (sweepOrphanedReviewWaits) covers the lost-timer
+// case; this is for when you want to decide.
+function forceDoneCard(id) {
+  const c = card(id)
+  if (!c || c.status !== 'review-wait') return
+  patchCard(id, { status: 'done', doneAt: Date.now(), holdingReview: false, reviewWaitSince: null, ts: Date.now() })
+  if (c.sid && c.sid === c.stored) {
+    setTimeout(() => { host.request('session.close', { session_id: c.sid }).catch(() => {}) }, CLOSE_AFTER_DONE_MS)
+  }
+}
+// Dead-timer reconciliation: a card in 'review-wait' must have a live
+// waitReview poll, but teardownWired() (pane unmount / plugin dispose) can
+// clear the timer while the card's in-memory status stays 'review-wait' —
+// and if the module isn't re-imported, hydrate() never re-runs to rebuild it,
+// so the card counts forever with the review long done. This sweep (called
+// from the Board's 1 s tick, throttled) re-arms any review-wait card that has
+// no live timer. Idempotent: cards WITH a timer are left alone. This is the
+// actual self-heal for the lost-timer state the REVIEW_STALL_MS backstop
+// can't reach (that one only fires while the timer is still alive).
+let lastReviewSweep = 0
+function sweepOrphanedReviewWaits() {
+  const now = Date.now()
+  if (now - lastReviewSweep < 10000) return
+  lastReviewSweep = now
+  for (const c of state.cards) {
+    if (c.status === 'review-wait' && !reviewTimers.has(c.id)) {
+      waitReview(c.id).then(() => {
+        const cur = card(c.id)
+        if (cur && cur.status === 'review-wait') patchCard(c.id, { status: 'done', doneAt: Date.now(), ts: Date.now() })
+      })
+    }
+  }
+}
 function reorderCard(fromId, targetId) {
   const cards = [...state.cards]
   const fi = cards.findIndex((c) => c.id === fromId)
@@ -739,7 +803,7 @@ async function hydrate() {
             const cur = card(c.id)
             if (!cur || cur.status !== 'running') return
             if (!ok) { patchCard(c.id, { status: 'failed', err: `turn stall: no completion after ${Math.round(TURN_STALL_MS / 3600000)}h (session left open)`, ts: Date.now() }); return }
-            patchCard(c.id, { status: 'review-wait', ts: Date.now() })
+            patchCard(c.id, { status: 'review-wait', reviewWaitSince: Date.now(), ts: Date.now() })
             waitReview(c.id).then(() => {
               const cur2 = card(c.id)
               if (cur2 && cur2.status === 'review-wait') patchCard(c.id, { status: 'done', doneAt: Date.now() })
@@ -784,7 +848,7 @@ function ensureWired() {
     setTimeout(() => {
       const c2 = card(c.id)
       if (c2 && (c2.status === 'running' || c2.status === 'launching') && !isBusy(sid)) {
-        patchCard(c2.id, { status: 'review-wait', ts: Date.now() })
+        patchCard(c2.id, { status: 'review-wait', reviewWaitSince: Date.now(), ts: Date.now() })
       }
     }, 2500)
   })
@@ -1233,6 +1297,14 @@ function CardRow({ c, onDragStart, onDropOn }) {
                 children: '✎',
               })
             : null,
+          c.status === 'review-wait'
+            ? jsx('button', {
+                title: 'Force done — the turn already completed; the review gate is stuck (lost timer / unverified review). Safe to release.',
+                onClick: () => forceDoneCard(c.id),
+                style: { border: 'none', background: 'transparent', color: 'var(--ui-accent)', cursor: 'pointer', fontSize: '0.7rem', padding: '1px 3px', borderRadius: '3px' },
+                children: '✓⏩',
+              })
+            : null,
           c.status === 'failed'
             ? jsx('button', {
                 title: 'Retry',
@@ -1258,7 +1330,7 @@ function Board() {
   const dragId = useRef(null)
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000)
+    const t = setInterval(() => { setNow(Date.now()); sweepOrphanedReviewWaits() }, 1000)
     return () => clearInterval(t)
   }, [])
 

@@ -3,6 +3,38 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.2.2 (2026-10-09 — review-gate robustness: lost-timer reconciliation)
+
+A card in `review-wait` was held by an in-memory 20 s poll. `teardownWired()`
+(pane unmount / plugin dispose) clears all timers; if the module wasn't
+re-imported afterward, `hydrate()` never re-ran and the card counted forever
+even though the review had long since completed (observed live: gate log said
+CLEARED, card held 4h+). The work was always done — the turn completes *before*
+the gate — so the card just needed a release.
+
+### Fixed / added
+
+- **`sweepOrphanedReviewWaits()`** — the Board's 1 s tick now re-arms any
+  `review-wait` card that has no live gate timer (throttled to 10 s,
+  idempotent). Lost-timer state self-heals within ~30 s of the next
+  verification poll.
+- **`REVIEW_STALL_MS` backstop (3 h)** — while a gate timer *is* alive and the
+  log says a review is STILL running, a wait past 3 h fails the card with a
+  retry hint instead of holding the lane forever (no review has ever run that
+  long on this box).
+- **`reviewWaitSince` persisted on the card** — all three `review-wait`
+  transitions stamp it; the backstop measures from the original wait start,
+  not from a timer rebuild after a remount.
+- **Manual escape hatch** — a `✓⏩` button appears on any `review-wait` card:
+  force-done (the turn already completed; safe) and closes the one-shot
+  session's slot like the normal done path.
+
+### Verified
+
+Gate regexes run against the live `agent.log` returned `CLEARED` for the
+wedged state (spawn 17:46 < done 18:22) — confirming the hold was a lost
+timer, not a real review.
+
 ## 1.2.1 (2026-10-08 — Phase 1 bugfix: new-project cards)
 
 Phase 1 (1.2.0) shipped a routing bug in `projectOf()`: the "new project"
