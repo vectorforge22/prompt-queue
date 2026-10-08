@@ -3,6 +3,36 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.2.1 (2026-10-08 — Phase 1 bugfix: new-project cards)
+
+Phase 1 (1.2.0) shipped a routing bug in `projectOf()`: the "new project"
+branch tested for an *exact* `project:new:` match, but a real card is always
+`project:new:<path>` (the form appends the folder). Every new-project card
+therefore fell into the *existing-project* lookup with a junk id
+(`new:<path>`), found nothing, and failed "deleted or archived?" — the
+`projects.create` path was unreachable. A retry re-ran the same broken
+lookup, so the card appeared "stuck" instead of failing.
+
+### Fixed
+
+- **New-project cards now route to create/adopt** — `projectOf` uses a
+  prefix test, so `project:new:<path>` → create-or-adopt; `project:<id>` →
+  existing project (unchanged).
+- **Adopting a manually-created project is now robust** — the
+  create-or-adopt dedupe compare (`samePath`) ignores case, trailing
+  separators, *and* slash direction, so a project you made by hand (or a
+  path typed with `/` instead of `\`) is adopted instead of re-created or
+  rejected as a duplicate (5063).
+- **Clearer "not found" error** — an unresolvable project target now says
+  the target may be stale and points at the 🎯 target picker to re-point
+  it, instead of implying the project was deleted/archived.
+
+### No change
+
+Storage key and card schema are untouched — a live queue (including your
+failed/stuck card) survives the update. Re-point that card at the real
+project (or a fresh `＋ New project…`) and Play; it now resolves.
+
 ## 1.2.0 (2026-10-07 — project targeting, roadmap Phase 1)
 
 Cards can now run into **desktop Projects** (the sidebar's named workspaces).

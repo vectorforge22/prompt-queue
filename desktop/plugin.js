@@ -303,14 +303,31 @@ async function refreshProjectList(force) {
   }
   return projectCache.list
 }
+// 'project:new:<path>' → { id: null, path: '<path>' }  (create-or-adopt)
+// 'project:<id>'       → { id: '<id>' }                (existing project)
+// Anything else        → null (not a project target).
+// NOTE: the new-project branch is a PREFIX test, not an exact match — a real
+// card is always 'project:new:<path>' (the form appends the folder), so an
+// exact-equality check here made every new-project card fall into the
+// existing-project path with a junk id 'new:<path>' and fail "not found".
 function projectOf(target) {
   if (typeof target !== 'string' || !target.startsWith(PROJECT_TARGET_PREFIX)) return null
-  return target === NEW_PROJECT_PREFIX ? { id: null, path: '' } : { id: target.slice(PROJECT_TARGET_PREFIX.length) }
+  if (target.startsWith(NEW_PROJECT_PREFIX)) return { id: null, path: target.slice(NEW_PROJECT_PREFIX.length) }
+  return { id: target.slice(PROJECT_TARGET_PREFIX.length) }
 }
 function projectTitle(c) {
   const t = (c && c.target) || ''
-  if ((c && c.targetTitle) && t !== NEW_PROJECT_PREFIX) return c.targetTitle
-  return t === NEW_PROJECT_PREFIX ? '(new project)' : t
+  const ref = projectOf(t)
+  if (ref && ref.id === null) return (c && c.targetTitle) || 'new project'
+  return (c && c.targetTitle) || t
+}
+// Path compare that ignores case, trailing separators, AND internal slash
+// direction (Windows treats C:/x and C:\x as the same dir), so "adopt the
+// project the user already made" matches a manually-created project even if
+// the typed path differs in any of those ways.
+function samePath(a, b) {
+  const norm = (s) => String(s || '').trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  return norm(a) !== '' && norm(a) === norm(b)
 }
 
 // ── engine ──────────────────────────────────────────────────────────────────
@@ -389,7 +406,7 @@ async function runCard(id) {
     if (ref.id) {
       const proj = list.find((p) => p.id === ref.id)
       if (!proj) {
-        patchCard(id, { status: 'failed', err: `project "${c.targetTitle || ref.id}" not found (deleted or archived?)`, ts: Date.now() })
+        patchCard(id, { status: 'failed', err: `project "${c.targetTitle || ref.id}" not found — it may have been deleted/archived, or the card's target is stale. Re-point it in the 🎯 target picker (or add a new project) and retry.`, ts: Date.now() })
         return
       }
       if (!proj.path) {
@@ -408,7 +425,7 @@ async function runCard(id) {
       // failed session.create after a successful projects.create, then retry)
       // reuses the existing project instead of hitting 5063 (duplicate
       // primary path).
-      const dupe = list.find((p) => p.path && p.path.toLowerCase() === rawPath.toLowerCase())
+      const dupe = list.find((p) => samePath(p.path, rawPath))
       let createdProj = dupe || null
       if (!createdProj) {
         try {
