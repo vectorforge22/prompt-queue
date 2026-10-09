@@ -3,15 +3,18 @@
 ![Prompt Queue pane](docs/screenshots/prompt-queue.png)
 
 Kanban-style prompt queue for the [Hermes desktop app](https://hermes-agent.nousresearch.com/docs).
-Each card is a prompt. Press **▶ Play** and the queue drains strictly top-down:
-each card becomes a **real new desktop session** (visible in the sidebar, openable
-with the ↗ on the card), runs its prompt, waits for the turn to finish, waits for
-any **background self-improvement review** to fully complete (strict gate), then
-fires the next card.
+Each card is a prompt **plus a target mode** — a fresh session (default), an
+existing session, a desktop project, or a profile's canonical Bot Chat. Press
+**▶ Play** and the queue drains strictly top-down: each card runs its prompt
+in its target, waits for the turn to finish, waits for any
+**background self-improvement review** to fully complete (strict gate), then
+fires the next card. Fresh-session cards get a real visible sidebar session
+that is closed after their turn; follow-up cards (session / bot modes) feed an
+existing conversation and are never closed.
 
-Built for feeding a local-model setup a list of prompts one fresh session at a
-time — without the next prompt fighting the background review for the inference
-slot — while keeping every session visible in the normal sidebar.
+Built for feeding a local-model setup a list of prompts one at a time —
+without the next prompt fighting the background review for the inference slot
+— while keeping every created session visible in the normal sidebar.
 
 ## What it adds
 
@@ -34,18 +37,27 @@ slot — while keeping every session visible in the normal sidebar.
 - **Slot hygiene** — after a card's turn, its one-shot session's
   active-session slot is released (`session.close`; the sidebar row stays), so a
   long queue can't exhaust the session cap.
-- **Card targets** — each card can run into a **new session** (default),
-  an **existing session** (picker of the latest 10 with a reply, or paste a
-  session ID), or a **project** (`📁`): the picker's Project section lists
-  the active profile's projects and a **＋ New project…** form (name +
-  folder path). A project card always runs in a *fresh* session whose cwd
-  is the project's primary path, so the session appears under that project
-  in the sidebar; a "new project" card creates it first (idempotently — a
-  retry or a second card on the same folder reuses it). Set at add time or
-  per-card (`🎯 target ▾`); a queued card can be repointed before it fires.
-  Session targets attach via `session.resume` and are **never closed** by
-  the plugin (the idle reaper frees their slot, as with any session you
-  use); project sessions are one-shots and are closed after their turn.
+- **Card targets — a MODE per card** — each card runs into one of four modes:
+  a **new session** (default, one-shot), an **existing session** (picker of
+  the latest 10 with a reply, or paste a session ID), a **project** (`📁`) —
+  the picker's Project section lists the active profile's projects and a
+  **＋ New project…** form (name + folder path); a project card always runs in
+  a *fresh* session whose cwd is the project's primary path, so it appears
+  under that project in the sidebar, and a "new project" card creates it
+  first (idempotently — a retry or a second card on the same folder reuses it)
+  — or a **bot** (`🤖`): the picker's Bot section lists this backend's
+  profiles; a bot card feeds that profile's one canonical hidden **"Bot Chat"**
+  session (created on first use if missing), so queued prompts accumulate in
+  a bot's forever-chat instead of one-shot sessions. The engine resolves the
+  mode at fire time; resolution failures fail the card with a readable error
+  rather than wedging. Session and bot targets attach via `session.resume`
+  (profile-scoped for bots) and are **never closed** by the plugin (the idle
+  reaper frees their slot, as with any session you use); new- and project-mode
+  sessions are one-shots, closed after their turn. Set at add time or per-card
+  (`🎯 target ▾`); a queued card can be repointed before it fires. The gear's
+  **Default mode** (New session / Bot Chat) sets the target for cards added
+  without an explicit pick (the `::enqueue` chip) and the composer's starting
+  point — every card can still be re-pointed afterwards.
 - **Restart-safe** — queue state persists via plugin storage; a card running
   across an app restart is re-attached (or re-queued, never dropped).
 - **`::enqueue{prompt="…"}` transcript directive** — a chat turn can
@@ -98,11 +110,13 @@ hermes plugins install prompt-queue --enable
 
 A desktop build recent enough for: `host.request` gateway RPCs
 (`session.create`, `session.list`, `session.resume`, `prompt.submit`,
-`session.close`, `session.active_list`), `host.openSession`,
+`session.close`, `session.active_list`, `projects.list`, `projects.create`,
+`profiles.list`, `session.title`), `host.openSession`,
 `host.onEvent('message.complete')`, `host.state.busyBySession`, `host.logs`,
 `ctx.storage`, pane contributions with `dock`, and `TRANSCRIPT_DIRECTIVE_AREA`.
-Developed and verified against the 2026-09 build (all of the above confirmed
-in `tui_gateway/` + `apps/desktop/src/sdk` source).
+Developed and verified against the 2026-10 build (all of the above confirmed
+in `tui_gateway/` contracts + `apps/desktop/src/sdk` source; bot-mode
+resolution mirrors the desktop app's own canonical-chat contract).
 
 ## Trust & Autonomy
 

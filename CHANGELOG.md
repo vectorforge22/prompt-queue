@@ -3,6 +3,70 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.3.0 (2026-10-10 — Phase 2: modes framework + bot mode)
+
+The card target is now a **mode**: a named target resolver that turns a card's
+target string into session-create or -resume params at fire time. The existing
+targeting (new / existing session / project) became three built-in modes; the
+fourth — `bot` — feeds a profile's canonical **Bot Chat**, so queued prompts
+can accumulate in a bot's forever-chat instead of one-shot sessions.
+
+### Added
+
+- **Mode framework** — `modeOf(target)` classifies the card target by PREFIX
+  (the Phase-1 lesson: never exact equality); `resolveTarget(c)` is the engine
+  entry point and returns a plan (`kind: new|existing`, cwd, profile, close-on
+  done). A resolution failure now **fails the card with a readable error** —
+  the Phase-1 "stuck card" class (broken target + retry re-running the same
+  broken path) can't happen: nothing wedges silently.
+- **Bot mode (`bot:<profile>`, 🤖)** — the picker gains a **Bot** section
+  (this backend's profiles, from `profiles.list`). At fire time the resolver
+  mirrors the desktop app's canonical-chat contract, **name-as-identity, never
+  an id pin**:
+  - Registry lookup: `session.list { title: "Bot Chat", include_hidden: true }`
+    scoped to the profile; opens the lineage tip (`resolved_id`) when it
+    exists — exactly one RPC, no create.
+  - **Fail closed** on a lookup error (post-restart warm-up race must never
+    read as "no Bot Chat"), and on zero rows + roster claiming
+    `canonical_session.id` (unconfirmed absence — a backend mid-restart can
+    answer empty).
+  - Confirmed absence → create the ONE forever chat: `session.create`
+    `{profile, title: "Bot Chat", hidden: true, follow_profile_config: true}`
+    + an **eager `session.title`** (materializes the row under the canonical
+    name before the untitled window can fork a duplicate). On a title
+    conflict: adopt the winner; if no winner is visible → fail closed.
+  - Bot cards set **no stored key** (the resolved row is a live handle, not
+    identity) — re-runs re-resolve by name; the card's ↗ stays hidden and
+    the bot's roster row remains the door to its chat. Resume rides
+    `{profile}`; the plugin never closes a Bot Chat (target sessions are
+    never closed).
+- **Default-mode gear** — `Default mode: New session | Bot Chat` sets the
+  target for cards added without an explicit pick (the `::enqueue` chip) and
+  the composer's starting point. It follows live in the composer only while
+  the composer still holds the previous default — an explicit picker choice is
+  user intent and isn't clobbered. `'session'` isn't offered as a default (no
+  sensible concrete target).
+- **Storage payload v3** under the SAME key (v1/v2 queues survive; bot cards
+  are pure string targets — no card-shape change).
+
+### Changed
+
+- `runCard()` no longer inlines project logic — it calls `resolveTarget()`
+  (same behavior, one resolver per mode; the project branch is Phase 1's
+  verbatim, including idempotent create + re-anchor and the readable
+  not-found error).
+- Picker / card chips show a mode icon (`＋` `→` `📁` `🤖`); bot cards read
+  "profile · Bot Chat".
+
+### Verified
+
+`node --check` + a 39-assertion unit test running the REAL `plugin.js` in a
+vm sandbox with stubbed RPCs: mode classification (incl. prefix-vs-exact on
+`project:new:<path>`), default targets, bot resolution paths (existing row →
+one lookup only; lookup error / unconfirmed absence / conflict-without-winner
+all fail closed with no create; clean create issues profile-scoped hidden
+create + eager title), roster normalization.
+
 ## 1.2.2 (2026-10-09 — review-gate robustness: lost-timer reconciliation)
 
 A card in `review-wait` was held by an in-memory 20 s poll. `teardownWired()`

@@ -12,8 +12,17 @@ docs.
   `roadmap`): `project:<id>` + `project:new:<path>` targets in the picker,
   `projects.list`/`projects.create` RPCs, `session.create {cwd}`, idempotent
   create with card re-anchoring, storage payload v2 (same key — live queues
-  survive). Pending: Arthur's real-run eyeball (pick a project target,
-  Play, confirm the session lands under the project in the sidebar).
+  survive). Bugfix 1.2.1 (projectOf prefix test); review-gate robustness in
+  1.2.2 (lost-timer reconciliation + force-done escape).
+- **Phase 2 (Modes) — IMPLEMENTED 2026-10-10** (v1.3.0 on `roadmap`): mode =
+  target resolver refactor (`modeOf` prefix classification, `resolveTarget`
+  engine entry — a failed resolution FAILS the card, never wedges); built-ins
+  new / session / project / **bot**; bot mode resolves the profile's canonical
+  "Bot Chat" name-as-identity (fail-closed registry, eager title, adopt-
+  before-mint), profile-scoped resume, never closed; default-mode gear (new |
+  bot); storage payload v3 (same key). Pending: Arthur's real-run eyeball —
+  queue a card to a bot and confirm the prompt lands in that profile's Bot
+  Chat.
 
 ## Feature feasibility (verified against source)
 

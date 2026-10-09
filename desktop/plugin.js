@@ -1,13 +1,17 @@
 // prompt-queue — kanban-style prompt queue for Hermes Desktop.
 //
-// Each card = a prompt. Play (manual) drains the queue strictly top-down:
-//   GLOBAL GATE (any session working?) → session.create → prompt.submit →
-//   wait turn (message.complete for that session) → strict review gate
-//   (no background review may still be running) → mark done → close the
-//   one-shot session's slot → next card.
-// Every card gets a REAL desktop session (visible in the sidebar); its
-// active-session slot is released after the turn so a long queue can't
-// exhaust the cap.
+// Each card = a prompt + a MODE (where it runs). Play (manual) drains the
+// queue strictly top-down:
+//   GLOBAL GATE (any session working?) → resolve target mode →
+//   prompt.submit → wait turn (message.complete for that session) → strict
+//   review gate (no background review may still be running) → mark done →
+//   close the one-shot session's slot (new/project modes only) → next card.
+// Modes (Phase 2): new / session / project / bot — a mode is a named target
+// resolver (card.target string → session-create or -resume params). New and
+// project modes get a REAL fresh sidebar session, closed after the turn so a
+// long queue can't exhaust the slot cap. Session and bot modes feed an
+// EXISTING conversation and are never closed by the plugin. Bot mode feeds
+// a profile's canonical hidden "Bot Chat" (name-as-identity — see below).
 //
 // TWO independent gates protect the single local-model slot:
 //   1. Global session gate — session.active_list (authoritative,
@@ -23,15 +27,21 @@
 // Renderer-only disk plugin (loaded uncompiled): only @hermes/plugin-sdk /
 // react / react/jsx-runtime resolve. UI is written with jsx() calls.
 //
-// State: ctx.storage JSON ({v, cards, playing}) — schema v2. Card:
+// State: ctx.storage JSON ({v, cards, playing}) — schema v3. Card:
 //   { id, text, title, status, sid?, stored?, err?, ts, doneAt?,
 //     target?, targetTitle?, projectName? }
 //   status: queued | launching | running | review-wait | done | failed
-//   target: 'new' (default, fresh session) | a session key (follow-up)
-//           | 'project:<id>' (fresh session under an existing desktop
-//             project: session.create cwd = project primary path)
-//           | 'project:new:<path>' (projects.create first, then the same;
-//             the card is re-anchored to the created id at fire time)
+//   target is a MODE STRING resolved at fire time (Phase 2 modes framework):
+//     'new'              → new mode: fresh session (default)
+//     <session key>      → session mode: follow-up into that existing session
+//     'project:<id>'     → project mode: fresh session under an existing
+//                          desktop project (cwd = project primary path)
+//     'project:new:<p>'  → project mode: projects.create first, then the same
+//                          (the card is re-anchored to the created id)
+//     'bot:<profile>'    → bot mode: the profile's canonical Bot Chat — the
+//                          hidden session titled exactly "Bot Chat" on that
+//                          profile. Name-as-identity, never an id pin (see
+//                          resolveBotMode for the fail-closed rules).
 //
 // Review gate (lifted from bg-review-watch): at most one background review
 // runs at a time; running ⇔ latest spawn ts > latest completion ts.
@@ -45,9 +55,10 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 import { useSyncExternalStore, useState, useEffect, useRef, Fragment } from 'react'
 
 // ── constants ───────────────────────────────────────────────────────────────
-// Schema v2 (cards gained project targeting) lives under the SAME storage key
-// as v1 — hydrate() must find the old key or a live queue would vanish on a
-// plugin update. Cards without project fields load and behave exactly as v1.
+// Schema v3 (cards gained bot-mode targets — pure string values; no card
+// shape change) lives under the SAME storage key as v1/v2 — hydrate() must
+// find the old key or a live queue would vanish on a plugin update. Cards
+// without project fields load and behave exactly as before.
 const STORE_KEY = 'prompt-queue-state-v1'
 const REVIEW_POLL_MS = 20000
 const TURN_FALLBACK_POLL_MS = 10000
@@ -78,9 +89,14 @@ const RE_DONE = /(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review 
 //   | 'auto' (legacy behavior: directive adds the card immediately).
 // gateFailOpen: default false (FAIL CLOSED — a review-verification error
 //   holds the queue with a visible state; true = legacy fail-open).
+// defaultMode (Phase 2): mode the composer preselects — 'new' | 'bot'. It
+//   sets the target for cards added without an explicit pick (the ::enqueue
+//   chip) and the section the picker opens on; per-card override is always
+//   possible (the picker itself). 'session' has no sensible default target,
+//   so it's not offered here.
 // Persisted under a separate storage key so settings survive restarts.
 const SETTINGS_KEY = 'prompt-queue-settings-v1'
-let settings = { modelSuggested: 'ask', gateFailOpen: false }
+let settings = { modelSuggested: 'ask', gateFailOpen: false, defaultMode: 'new' }
 const settingsSubs = new Set()
 function useSettings() {
   return useSyncExternalStore(
@@ -97,6 +113,7 @@ async function loadSettings() {
         settings = {
           modelSuggested: s.modelSuggested === 'auto' ? 'auto' : 'ask',
           gateFailOpen: s.gateFailOpen === true,
+          defaultMode: s.defaultMode === 'bot' ? 'bot' : 'new',
         }
       }
     }
@@ -154,7 +171,7 @@ function persist() {
     persistTimer = null
     try {
       if (engineCtx && engineCtx.storage) {
-        await engineCtx.storage.set(STORE_KEY, { v: 2, cards: state.cards, playing: false })
+        await engineCtx.storage.set(STORE_KEY, { v: 3, cards: state.cards, playing: false })
       }
     } catch { /* storage blip — retried on the next transition */ }
   }, 400)
@@ -289,6 +306,13 @@ function pickerSessions() { return sessionCache.list.slice(0, PICKER_SHOW) }
 // session.create uses — same profile, same projects.db.
 const PROJECT_TARGET_PREFIX = 'project:'
 const NEW_PROJECT_PREFIX = 'project:new:'
+// Bot mode (Phase 2): a bot IS a profile, and its forever-chat is the session
+// titled exactly "Bot Chat" on that profile — name-as-identity, never an id
+// pin (apps/desktop canonical-chat contract: five hardening waves killed the
+// pointer design; a name cannot dangle). The card only stores the PROFILE;
+// the session row is resolved fresh at fire time.
+const BOT_TARGET_PREFIX = 'bot:'
+const CANONICAL_CHAT_TITLE = 'Bot Chat'
 let projectCache = { at: 0, list: [] }
 const PROJECT_LIST_REFRESH_MS = 30000
 
@@ -326,6 +350,7 @@ function projectOf(target) {
 }
 function projectTitle(c) {
   const t = (c && c.target) || ''
+  if (modeOf(t) === 'bot') return (String(t).slice(BOT_TARGET_PREFIX.length).trim() || 'default') + " · Bot Chat"
   const ref = projectOf(t)
   if (ref && ref.id === null) return (c && c.targetTitle) || 'new project'
   return (c && c.targetTitle) || t
@@ -337,6 +362,249 @@ function projectTitle(c) {
 function samePath(a, b) {
   const norm = (s) => String(s || '').trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
   return norm(a) !== '' && norm(a) === norm(b)
+}
+
+// ── mode framework (Phase 2) ────────────────────────────────────────────────
+// A MODE is a named target resolver: card.target → session-create or resume
+// params at fire time. The built-ins are:
+//   new     — fresh session ('new' target)
+//   session — follow-up into an existing session (target = its session key)
+//   project — fresh session under a desktop project ('project:*')
+//   bot     — the profile's canonical Bot Chat ('bot:<profile>')
+// Later modes (e.g. kanban) add an entry here + a picker section; the engine
+// switch in runCard() and the card display helpers are the only other touch
+// points. Default mode lives in settings.defaultMode; per-card override is
+// just the card's target string.
+// NOTE: prefix tests, never exact equality (the Phase-1 lesson) — 'bot:x'
+// and 'project:*' always carry their payload.
+function modeOf(target) {
+  if (typeof target !== 'string' || !target) return 'new'
+  if (target === 'new') return 'new'
+  if (target.startsWith(PROJECT_TARGET_PREFIX)) return 'project'
+  if (target.startsWith(BOT_TARGET_PREFIX)) return 'bot'
+  return 'session' // bare session key (the sidebar's row id IS the key)
+}
+// Per-card display helpers: a bot card's targetTitle is the PROFILE name, so
+// the chip reads "profile · Bot Chat" (via projectTitle below), never like a
+// plain session title.
+function modePrefixOf(target) {
+  return { project: '📁', bot: '🤖', session: '→', new: '＋' }[modeOf(target)] || '→'
+}
+// The target a card gets when none was chosen explicitly (e.g. an ::enqueue
+// chip with defaultMode='bot'). 'new' → 'new'; 'bot' → the DEFAULT profile's
+// canonical Bot Chat (the one profile name every backend has); 'session' has
+// no sensible concrete pick, so it falls back to a fresh session — the
+// composer's picker still opens on that section for an explicit choice.
+function defaultTarget() {
+  if (settings.defaultMode === 'bot') return BOT_TARGET_PREFIX + 'default'
+  return 'new'
+}
+
+// ── profile roster (bot mode) ───────────────────────────────────────────────
+// profiles.list is the ws twin of /api/profiles; rows carry name, model,
+// description, and canonical_session (the "Bot Chat" registry row, resolved
+// server-side by title). The plugin's host.request hits the active
+// connection's backend — bot:<profile> targets only make sense for profiles
+// on THIS backend (a remote-connection bot has no route from a renderer-only
+// plugin; those need the agent-side subpackage, roadmap phase 5).
+let profileCache = { at: 0, list: [] }
+const PROFILE_LIST_REFRESH_MS = 30000
+
+async function refreshProfileList(force) {
+  const now = Date.now()
+  if (!force && profileCache.list.length && now - profileCache.at < PROFILE_LIST_REFRESH_MS) {
+    return profileCache.list
+  }
+  try {
+    const res = await host.request('profiles.list', {})
+    const rows = (res && res.profiles) || []
+    profileCache = {
+      at: now,
+      list: rows
+        .filter((p) => p && p.name)
+        .map((p) => ({
+          name: p.name,
+          model: p.model || null,
+          description: p.description || '',
+          // canonical_session = the server-side "Bot Chat" registry row —
+          // last positive confirmation the profile HAS a bot chat (used by
+          // resolveBotMode's fail-closed branch).
+          canonical: p.canonical_session && p.canonical_session.id ? p.canonical_session : null,
+        }))
+        .sort((a, b) => {
+          if ((b.name === 'default') !== (a.name === 'default')) return a.name === 'default' ? -1 : 1
+          return String(a.name).localeCompare(String(b.name))
+        }),
+    }
+  } catch {
+    /* keep the stale cache (or empty) — fail-open, like the other pickers */
+  }
+  return profileCache.list
+}
+
+// ── bot mode resolver ───────────────────────────────────────────────────────
+// THE identity lookup: session.list { title: "Bot Chat", include_hidden: true }
+// scoped to the profile (indexed exact-title, window-free; hidden rows resolve
+// because canonical chats are always hidden). Name-as-identity — NO stored id
+// pin anywhere in this path.
+//
+// FAIL CLOSED, mirroring desktop's canonical-chat contract: a lookup that
+// THROWS must never read as "no Bot Chat exists" — the post-restart warm-up
+// race is exactly when a swallowed error would mint a duplicate forever chat.
+// Zero rows + the roster claiming canonical_session.id = unconfirmed absence
+// (a backend mid-restart can answer empty) — also fail closed. Zero rows with
+// no registry claim = confirmed absence → create it (adopt-before-mint: the
+// re-lookup inside this call is what prevents the fork; if session.title hits
+// "already in use" we adopt the winner instead of forking).
+// Returns { sid (stored key), profile, isNew } or throws.
+async function resolveBotMode(profileName) {
+  const p = String(profileName || '').trim()
+  if (!p) throw new Error('bot target has no profile name')
+
+  // 1 — consult the registry on the bot's own source (profile param).
+  let listRes
+  try {
+    listRes = await host.request('session.list', { profile: p, title: CANONICAL_CHAT_TITLE, include_hidden: true })
+  } catch (e) {
+    throw new Error(`could not check ${p}'s Bot Chat registry (${errMsg(e)}) — not starting a new chat`)
+  }
+  const rows = (listRes && listRes.sessions) || []
+  const match = rows.find((r) => {
+    const root = String((r && r.root_title) || '').trim()
+    const t = String((r && r.title) || '').trim()
+    return root === CANONICAL_CHAT_TITLE || (!root && t === CANONICAL_CHAT_TITLE)
+  })
+  if (match && match.id) {
+    // exact-lookup gateways report the compression-lineage tip as resolved_id;
+    // the registry row stays the identity.
+    return { sid: match.resolved_id || match.id, profile: p, isNew: false }
+  }
+
+  // Zero rows is NOT the same as a thrown error — a backend mid-restart can
+  // answer empty while the real chat still holds the canonical title. When
+  // the roster says this profile HAS a canonical row, that's unconfirmed
+  // absence: fail closed (retry) instead of minting a fork.
+  const roster = await refreshProfileList(true)
+  const row = roster.find((x) => x.name === p)
+  if (row && row.canonical && row.canonical.id) {
+    throw new Error(`could not confirm ${p}'s Bot Chat registry — not starting a new chat (retry in a moment)`)
+  }
+
+  // 2 — confirmed absence: create the ONE forever chat, born hidden.
+  let created
+  try {
+    created = await host.request('session.create', {
+      profile: p,
+      title: CANONICAL_CHAT_TITLE,
+      hidden: true,
+      follow_profile_config: true,
+    })
+  } catch (e) {
+    throw new Error(`session.create for ${p}'s Bot Chat failed: ${errMsg(e)}`)
+  }
+  const runtime = created && (created.session_id || created.sessionId)
+  const stored = created && (created.stored_session_id || created.storedSessionId)
+
+  // session.create is lazy: the stored row may not exist until the first
+  // prompt, and the turn-start auto-titler can race the deferred title. An
+  // eager session.title materializes the row NOW under the canonical name —
+  // without it a second card (or retry) during the untitled window would see
+  // zero rows and mint a duplicate.
+  let titled = false
+  if (runtime) {
+    try {
+      await host.request('session.title', { session_id: runtime, title: CANONICAL_CHAT_TITLE })
+      titled = true
+    } catch (e) {
+      // ADOPT-BEFORE-MINT: a title-uniqueness rejection means another writer
+      // took the canonical title between our registry miss and this write —
+      // re-consult and adopt the winner, never fork. If the re-consult STILL
+      // finds no row, fail closed (a wedged card is recoverable; a prompt
+      // silently landing in an untitled stray session would fork the forever
+      // chat and be invisible). Other title errors fall through: old
+      // gateways without the eager write persist the row on the first prompt.
+      if (/already in use/i.test(String((e && e.message) || e))) {
+        const again = await host.request('session.list', { profile: p, title: CANONICAL_CHAT_TITLE, include_hidden: true })
+        const winner = ((again && again.sessions) || []).find((r) => String(r.title) === CANONICAL_CHAT_TITLE || String(r.root_title) === CANONICAL_CHAT_TITLE)
+        if (winner && winner.id) return { sid: winner.resolved_id || winner.id, profile: p, isNew: false }
+        throw new Error(`could not confirm ${p}'s Bot Chat registry after a title conflict — not continuing (retry in a moment)`)
+      }
+      /* else: old gateway without the eager write — the row persists on the
+         first prompt submit below; the retry path re-consults by name. */
+    }
+  }
+
+  // Zero-message lazy sessions get pruned when no row exists yet (older
+  // gateways). If the eager title failed AND we have no stored id, return the
+  // runtime id anyway: session.resume accepts a live runtime id, and the card
+  // prompt's submit persists the row — the next resolution finds it by name.
+  const sid = stored || runtime
+  if (!sid) throw new Error(`session.create returned no id for ${p}'s Bot Chat`)
+  return { sid, profile: p, isNew: true }
+}
+
+// ── target resolution (engine entry into the mode framework) ────────────────
+// One call per card at fire time: card.target → { kind, sid?, stored?,
+// createCwd?, botProfile? }. kind 'new' (one-shot — closed after the turn) →
+// runCard mints a fresh
+// session (optionally with cwd); kind 'existing' → runCard resumes the given
+// key. Unresolvable targets THROW a user-readable error; runCard fails the
+// card with it (a failed resolution must never look like a stuck card).
+async function resolveTarget(c) {
+  const target = c.target || 'new'
+  switch (modeOf(target)) {
+    case 'new':
+      return { kind: 'new', createCwd: null }
+    case 'project': {
+      // Phase-1 logic: 'project:<id>' → existing project's cwd;
+      // 'project:new:<path>' → idempotent projects.create, then re-anchor.
+      const ref = projectOf(target)
+      const list = await refreshProjectList(true)
+      if (ref.id) {
+        const proj = list.find((p) => p.id === ref.id)
+        if (!proj) throw new Error(`project "${c.targetTitle || ref.id}" not found — it may have been deleted/archived, or the card's target is stale. Re-point it in the 🎯 target picker (or add a new project) and retry.`)
+        if (!proj.path) throw new Error(`project "${proj.name}" has no folder — add one in the sidebar, then retry`)
+        return { kind: 'new', createCwd: proj.path }
+      }
+      const rawPath = String(target.slice(NEW_PROJECT_PREFIX.length) || '').trim()
+      if (!rawPath) throw new Error('new project: no folder path set on the card')
+      const name = (c.projectName || '').trim() || rawPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      // Idempotent create: a card whose project was already minted (e.g. a
+      // failed session.create after a successful projects.create, then retry)
+      // reuses the existing project instead of hitting 5063 (duplicate
+      // primary path).
+      const dupe = list.find((p) => samePath(p.path, rawPath))
+      let createdProj = dupe || null
+      if (!createdProj) {
+        try {
+          const res = await host.request('projects.create', { name, primary_path: rawPath, folders: [rawPath] })
+          createdProj = res && res.project
+        } catch (e) {
+          throw new Error('projects.create: ' + errMsg(e))
+        }
+        if (!createdProj || !createdProj.id) throw new Error('projects.create returned no project')
+      }
+      // Anchor the card to the REAL project (id + resolved primary path) so a
+      // retry — or a second card re-pointed at it — doesn't re-create.
+      patchCard(c.id, { target: PROJECT_TARGET_PREFIX + createdProj.id, targetTitle: createdProj.name, projectName: name })
+      return { kind: 'new', createCwd: createdProj.primary_path || rawPath }
+    }
+    case 'bot': {
+      const profileName = String(target.slice(BOT_TARGET_PREFIX.length)).trim()
+      const r = await resolveBotMode(profileName)
+      // stored stays NULL: the resolved row (possibly a compression-lineage
+      // tip) is a live handle, not identity — pinning it would recreate the
+      // id-pointer failure class. Re-runs re-resolve by NAME.
+      return { kind: 'existing', sid: r.sid, stored: null, botProfile: r.profile }
+    }
+    case 'session':
+    default:
+      // Follow-up into an existing session. session.resume reattaches an
+      // already-live session WITHOUT taking the slot from clients already
+      // streaming it (gateway: _resume_reuse_live attaches alongside), so a
+      // target open in a tile is safe.
+      return { kind: 'existing', sid: target, stored: target }
+  }
 }
 
 // ── engine ──────────────────────────────────────────────────────────────────
@@ -402,69 +670,22 @@ async function runCard(id) {
     if (v2 === 'paused') return
   }
   patchCard(id, { status: 'launching', ts: Date.now(), err: null })
-  // Project targets are ALWAYS fresh sessions (created under the project's
-  // cwd) — they must not fall into the session.resume branch below.
-  const isProject = !!projectOf(c.target)
-  const isNew = !c.target || c.target === 'new' || isProject
-  // Phase 1: project targets — 'project:<id>' runs a fresh session inside an
-  // existing project; 'project:new:<path>' creates the project first.
-  let createCwd = null
-  if (isProject) {
-    const ref = projectOf(c.target)
-    const list = await refreshProjectList(true)
-    if (ref.id) {
-      const proj = list.find((p) => p.id === ref.id)
-      if (!proj) {
-        patchCard(id, { status: 'failed', err: `project "${c.targetTitle || ref.id}" not found — it may have been deleted/archived, or the card's target is stale. Re-point it in the 🎯 target picker (or add a new project) and retry.`, ts: Date.now() })
-        return
-      }
-      if (!proj.path) {
-        patchCard(id, { status: 'failed', err: `project "${proj.name}" has no folder — add one in the sidebar, then retry`, ts: Date.now() })
-        return
-      }
-      createCwd = proj.path
-    } else {
-      const rawPath = String(c.target.slice(NEW_PROJECT_PREFIX.length) || '').trim()
-      if (!rawPath) {
-        patchCard(id, { status: 'failed', err: 'new project: no folder path set on the card', ts: Date.now() })
-        return
-      }
-      const name = (c.projectName || '').trim() || rawPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
-      // Idempotent create: a card whose project was already minted (e.g. a
-      // failed session.create after a successful projects.create, then retry)
-      // reuses the existing project instead of hitting 5063 (duplicate
-      // primary path).
-      const dupe = list.find((p) => samePath(p.path, rawPath))
-      let createdProj = dupe || null
-      if (!createdProj) {
-        try {
-          const res = await host.request('projects.create', { name, primary_path: rawPath, folders: [rawPath] })
-          createdProj = res && res.project
-        } catch (e) {
-          patchCard(id, { status: 'failed', err: 'projects.create: ' + errMsg(e), ts: Date.now() })
-          return
-        }
-        if (!createdProj || !createdProj.id) {
-          patchCard(id, { status: 'failed', err: 'projects.create returned no project', ts: Date.now() })
-          return
-        }
-      }
-      // Anchor the card to the REAL project (id + resolved primary path) so a
-      // retry — or a second card re-pointed at it — doesn't re-create.
-      patchCard(id, {
-        target: PROJECT_TARGET_PREFIX + createdProj.id,
-        targetTitle: createdProj.name,
-        projectName: name,
-      })
-      createCwd = createdProj.primary_path || rawPath
-    }
+  // Mode framework (Phase 2): card.target is a MODE STRING — resolve it to
+  // session params now. A resolution failure fails the card with a readable
+  // error; it must never wedge (the Phase-1 "stuck card" class).
+  let plan
+  try {
+    plan = await resolveTarget(card(id))
+  } catch (e) {
+    patchCard(id, { status: 'failed', err: errMsg(e), ts: Date.now() })
+    return
   }
   let sid
   let stored
-  if (isNew) {
+  if (plan.kind === 'new') {
     let created
     try {
-      created = await host.request('session.create', { title: c.title, ...(createCwd ? { cwd: createCwd } : {}) })
+      created = await host.request('session.create', { title: c.title, ...(plan.createCwd ? { cwd: plan.createCwd } : {}) })
     } catch (e) {
       patchCard(id, { status: 'failed', err: 'session.create: ' + errMsg(e), ts: Date.now() })
       return
@@ -476,26 +697,28 @@ async function runCard(id) {
       return
     }
   } else {
-    // C1: follow-up into an existing session (target = its session key; the
-    // session.list row `id` IS the key). session.resume reattaches an
+    // kind 'existing': follow-up into an existing session — a plain session
+    // key or a bot's canonical Bot Chat. session.resume reattaches an
     // already-live session WITHOUT taking the slot from clients already
     // streaming it (gateway: _resume_reuse_live attaches alongside), so a
-    // target open in a tile is safe. RPC param name: session_id (the gateway
-    // treats it as the key/target, verified in methods_session.py).
+    // target open in a tile is safe. profile rides the resume for bot-mode
+    // targets (named-profile bots on a pooled backend); omitted for the
+    // active profile's plain sessions.
     let resumed
     try {
-      resumed = await host.request('session.resume', { session_id: c.target })
+      resumed = await host.request('session.resume', { session_id: plan.sid, ...(plan.botProfile ? { profile: plan.botProfile } : {}) })
     } catch (e) {
       patchCard(id, { status: 'failed', err: 'session.resume: ' + errMsg(e), ts: Date.now() })
       return
     }
     sid = resumed && (resumed.session_id || resumed.sessionId)
-    stored = c.target
+    stored = plan.stored
     if (!sid) {
       patchCard(id, { status: 'failed', err: 'session.resume returned no id', ts: Date.now() })
       return
     }
   }
+  const isNew = plan.kind === 'new'
   patchCard(id, { sid, stored, status: 'running', ts: Date.now() })
 
   // 2 — send the prompt. If the target is mid-turn the gateway ACCEPTS but
@@ -655,7 +878,9 @@ function addCard(text, target, targetTitle) {
   set({
     cards: [...state.cards, {
       id: uid(), text: t, title: sanitizeTitle(t), status: 'queued', ts: Date.now(),
-      target: target || 'new', targetTitle: targetTitle || null,
+      // Composer passes the current target; ::enqueue chips pass nothing →
+      // the default mode (settings.defaultMode).
+      target: target || defaultTarget(), targetTitle: targetTitle || null,
       // 'New project…' passes the typed name via targetTitle — keep a copy
       // under its own field so the engine can name the project it mints.
       projectName: (target || '').startsWith(NEW_PROJECT_PREFIX) ? (targetTitle || null) : null,
@@ -725,7 +950,13 @@ function CardActionsMenu({ c }) {
 }
 function openCardSession(c) {
   const key = c.stored || c.target
-  if (key && key !== 'new') host.openSession(key).catch(() => {})
+  if (!key || key === 'new') return
+  // Bot cards never set a stored key (name-as-identity — the resolved row is
+  // a live handle, not a pin), so their open button stays hidden; the bot's
+  // row in the Bots roster is the door to its chat by design.
+  if (modeOf(c.target) === 'bot' && !c.stored) return
+  const opts = modeOf(c.target) === 'bot' ? { profile: String(c.target.slice(BOT_TARGET_PREFIX.length)).trim() } : {}
+  host.openSession(key, opts).catch(() => {})
 }
 function retryCard(id) {
   patchCard(id, { status: 'queued', err: null, sid: null, stored: null, ts: Date.now() })
@@ -885,9 +1116,10 @@ function StatusDot({ status }) {
 }
 
 // ── gear: plugin settings ───────────────────────────────────────────────────
-// Two autonomy knobs (Phase 3): how model-suggested (::enqueue) prompts are
-// treated, and what the review gate does when its log verification errors.
-// Both default to the SAFE side (ask / fail-closed). Persisted via ctx.storage.
+// Three knobs: how model-suggested (::enqueue) prompts are treated, what the
+// review gate does when its log verification errors, and the default mode for
+// cards added without an explicit target (Phase 2). All default to the SAFE
+// side (ask / fail-closed / new session). Persisted via ctx.storage.
 function SettingsMenu() {
   const s = useSettings()
   const [open, setOpen] = useState(false)
@@ -949,7 +1181,16 @@ function SettingsMenu() {
                   jsx('button', { onClick: () => setSettings({ gateFailOpen: true }), style: seg(s.gateFailOpen), children: 'Open' }),
                 ],
               }),
-              jsx('div', { style: { ...rowStyle, color: 'var(--ui-text-quaternary)', fontSize: '0.62rem' }, children: 'If the background-review check can’t verify (log blip): “Hold” keeps the queue paused with a visible state (default, safer); “Open” proceeds and re-checks in 20 s.' }),
+              jsx('div', { style: { ...rowStyle, color: 'var(--ui-text-quaternary)', fontSize: '0.62rem', paddingBottom: '6px', borderBottom: '1px solid var(--ui-stroke-secondary)', marginBottom: '4px' }, children: 'If the background-review check can’t verify (log blip): “Hold” keeps the queue paused with a visible state (default, safer); “Open” proceeds and re-checks in 20 s.' }),
+              jsxs('div', {
+                style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 6px 5px', borderBottom: '1px solid var(--ui-stroke-secondary)', marginBottom: '4px' },
+                children: [
+                  jsx('span', { style: { fontSize: '0.68rem', fontWeight: 600, color: 'var(--ui-text-secondary)', flex: 1 }, children: 'Default mode' }),
+                  jsx('button', { onClick: () => setSettings({ defaultMode: 'new' }), style: seg(s.defaultMode === 'new'), children: 'New session' }),
+                  jsx('button', { onClick: () => setSettings({ defaultMode: 'bot' }), style: seg(s.defaultMode === 'bot'), title: "Cards added without an explicit target (e.g. the ::enqueue chip) go into the DEFAULT profile's one \"Bot Chat\".", children: 'Bot Chat' }),
+                ],
+              }),
+              jsx('div', { style: { ...rowStyle, color: 'var(--ui-text-quaternary)', fontSize: '0.62rem' }, children: 'Target for cards added without an explicit pick (the ::enqueue chip). “New session” is the classic one-shot session; “Bot Chat” feeds the default profile’s forever chat. Every card can still be re-pointed in its 🎯 picker — modes: new session, project, bot, or any existing session.' }),
             ],
           })
         : null,
@@ -960,8 +1201,9 @@ function SettingsMenu() {
 // ── C1 UI: target picker ────────────────────────────────────────────────────
 // value undefined → trigger button ("🎯 target ▾"); value provided →
 // composer-style button showing the current choice. onSelect(value, title).
-// Sections: New session / Projects (existing + "New project…" inline form) /
-// sessions (latest 10 with a reply) / manual session ID.
+// Sections (Phase 2 modes): New session / Projects (existing + "New project…"
+// inline form) / Bots (profiles' canonical Bot Chat) / sessions (latest 10
+// with a reply) / manual session ID.
 function TargetPicker({ value, trigger, onSelect }) {
   const [open, setOpen] = useState(false)
   const [goUp, setGoUp] = useState(false)
@@ -969,6 +1211,7 @@ function TargetPicker({ value, trigger, onSelect }) {
   const [manualErr, setManualErr] = useState('')
   const [sessions, setSessions] = useState(pickerSessions())
   const [projects, setProjects] = useState(projectCache.list)
+  const [profiles, setProfiles] = useState(profileCache.list)
   const [newProj, setNewProj] = useState(false)
   const [projName, setProjName] = useState('')
   const [projPath, setProjPath] = useState('')
@@ -990,6 +1233,7 @@ function TargetPicker({ value, trigger, onSelect }) {
     if (!open) return
     refreshSessionList(true).then((list) => setSessions(list.slice(0, PICKER_SHOW)))
     refreshProjectList(true).then((list) => setProjects(list))
+    refreshProfileList(true).then((list) => setProfiles(list))
     return undefined
   }, [open])
   useEffect(() => {
@@ -1001,7 +1245,9 @@ function TargetPicker({ value, trigger, onSelect }) {
     return () => document.removeEventListener('mousedown', onDoc)
   }, [open])
   const projRef = projectOf(value)
+  const botRef = typeof value === 'string' && value.startsWith(BOT_TARGET_PREFIX) ? value.slice(BOT_TARGET_PREFIX.length).trim() : null
   const currentTitle = value === 'new' ? 'New session'
+    : botRef != null ? (botRef || 'default') + " · Bot Chat"
     : projRef ? (projectTitle({ target: value, targetTitle: projRef.id ? value : null }) || value)
     : (sessions.find((s) => s.id === value) || {}).title || value
   const pick = (v, title) => { onSelect(v, title); setOpen(false) }
@@ -1011,7 +1257,8 @@ function TargetPicker({ value, trigger, onSelect }) {
     pick(NEW_PROJECT_PREFIX + path, projName.trim())
     setNewProj(false); setProjName(''); setProjPath('')
   }
-  const btnLabel = trigger || (value === undefined ? '🎯 target' : (value === 'new' ? '🎯 New session' : `🎯 ${projRef ? '📁 ' : '→ '}${currentTitle}`))
+  const modePrefix = { project: '📁 ', bot: '🤖 ', session: '→ ', new: '＋ ' }[modeOf(value)] || ''
+  const btnLabel = trigger || (value === undefined ? '🎯 target' : (value === 'new' ? '🎯 New session' : `🎯 ${modePrefix}${currentTitle}`))
   const rowStyle = { padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
   const sectionLabel = '— '
   return jsxs('div', {
@@ -1121,6 +1368,30 @@ function TargetPicker({ value, trigger, onSelect }) {
                     ],
                   })
                 : null,
+              jsxs('div', {
+                style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
+                children: [sectionLabel, 'Bot (profile Bot Chat)', sectionLabel],
+              }),
+              profiles.length === 0
+                ? jsx('div', { style: { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No profiles on this backend' })
+                : null,
+              profiles.map((pr) =>
+                jsxs('div', {
+                  key: pr.name,
+                  title: [pr.description, pr.model ? 'model: ' + pr.model : null, "Runs into this profile's hidden \"Bot Chat\" (created on first use if missing)"].filter(Boolean).join(' · '),
+                  onClick: () => pick(BOT_TARGET_PREFIX + pr.name, pr.name),
+                  style: {
+                    ...rowStyle,
+                    color: botRef === pr.name ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
+                    fontWeight: botRef === pr.name ? 600 : 400,
+                  },
+                  children: ['🤖 ', pr.name, pr.model ? ` · ${pr.model}` : ''],
+                }),
+              ),
+              jsxs('div', {
+                style: { padding: '2px 9px 4px', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+                children: ['The prompt lands in the profile’s one forever "Bot Chat" — name-as-identity, created on first use if missing.'],
+              }),
               jsxs('div', {
                 style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
                 children: [sectionLabel, 'Session', sectionLabel],
@@ -1238,16 +1509,18 @@ function CardRow({ c, onDragStart, onDropOn }) {
                   }),
                   c.target && c.target !== 'new'
                     ? jsxs(Tip, {
-                        label: projectOf(c.target)
+                        label: modeOf(c.target) === 'project'
                           ? `Runs in a fresh session under project: ${projectTitle(c)}`
-                          : `Follow-up into: ${c.targetTitle || c.target}`,
+                          : modeOf(c.target) === 'bot'
+                            ? `Runs into the profile's one "Bot Chat": ${String(c.target).slice(BOT_TARGET_PREFIX.length).trim() || 'default'}`
+                            : `Follow-up into: ${c.targetTitle || c.target}`,
                         children: jsx('span', {
                           style: {
                             fontSize: '0.625rem', color: 'var(--ui-text-quaternary)',
                             whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                             maxWidth: '110px', flexShrink: 1,
                           },
-                          children: `${projectOf(c.target) ? '📁' : '→'} ${projectTitle(c)}`,
+                          children: `${modePrefixOf(c.target)} ${projectTitle(c)}`,
                         }),
                       })
                     : null,
@@ -1324,9 +1597,22 @@ function CardRow({ c, onDragStart, onDropOn }) {
 
 function Board() {
   const q = useQueue()
+  const s = useSettings()
   const [draft, setDraft] = useState('')
-  const [draftTarget, setDraftTarget] = useState('new')
+  // The composer's target follows the gear's default mode — but only while
+  // it still holds the PREVIOUS default: an explicit picker choice (or any
+  // divergence) is user intent and a later settings change must not clobber
+  // it mid-compose.
+  const [draftTarget, setDraftTarget] = useState(defaultTarget)
   const [draftTargetTitle, setDraftTargetTitle] = useState(null)
+  const prevDefaultMode = useRef(s.defaultMode)
+  useEffect(() => {
+    if (prevDefaultMode.current === s.defaultMode) return
+    const prev = prevDefaultMode.current
+    prevDefaultMode.current = s.defaultMode
+    // display titles are derived from the target string — nothing else to sync
+    if (draftTarget === (prev === 'bot' ? BOT_TARGET_PREFIX + 'default' : 'new')) setDraftTarget(defaultTarget())
+  }, [s.defaultMode]) // eslint-disable-line react-hooks/exhaustive-deps
   const dragId = useRef(null)
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
