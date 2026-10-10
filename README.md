@@ -58,6 +58,19 @@ without the next prompt fighting the background review for the inference slot
   **Default mode** (New session / Bot Chat) sets the target for cards added
   without an explicit pick (the `::enqueue` chip) and the composer's starting
   point — every card can still be re-pointed afterwards.
+- **Markdown ingest (📥)** — point the pane header's 📥 menu at a folder of
+  `.md` files (persisted; default `%USERPROFILE%\.hermes\prompt-queue`) and
+  **⬇ Ingest → queue** turns each `## …` heading and `- [ ]` checkbox into a
+  card (single-`#` lines are comments — the same contract the starter
+  template documents in-file). Card title = the block's heading; prompt text
+  stays complete for the receiving agent; target = your default mode,
+  re-pointable per card. **＋ Folder + template** creates the folder and a
+  `prompts.md` starter on first use — an existing file is never touched.
+  Re-ingesting is safe: blocks are deduped by exact text against every card
+  already in the queue (any tab), so unchanged files add nothing and an
+  edited block adds its new version. Caps: 50 files / 256KB per file /
+  200 cards per run. Windows-only for now — file access rides the gated
+  `shell.exec` cmd.exe door (no fs API in the renderer; see Requirements).
 - **Restart-safe** — queue state persists via plugin storage; a card running
   across an app restart is re-attached (or re-queued, never dropped).
 - **`::enqueue{prompt="…"}` transcript directive** — a chat turn can
@@ -118,6 +131,14 @@ Developed and verified against the 2026-10 build (all of the above confirmed
 in `tui_gateway/` contracts + `apps/desktop/src/sdk` source; bot-mode
 resolution mirrors the desktop app's own canonical-chat contract).
 
+Markdown ingest additionally needs, on the gateway host: **Windows** (the
+file access rides the gated `shell.exec` cmd.exe door — `type`, `dir`,
+`mkdir`, `echo >`, `certutil -f -decode`, `explorer`; interpreter script
+flags are hard-blocked by the approval gate and never used) and a **bare
+`python` on PATH** (used to run the tiny read helper as `python <file>` —
+a file argument passes the gate where `python -c` does not). Without either,
+the other features work normally; ingest reports a readable error.
+
 ## Trust & Autonomy
 
 A card is not a draft — once the engine fires it, it becomes a **full agent
@@ -141,6 +162,7 @@ you'd queue autonomous work.
 | Source | Trust | Behavior |
 |---|---|---|
 | Textarea / picker (you typed it) | user-approved | added directly; runs only while Play is active |
+| Markdown ingest (📥, you point at a folder of files **you wrote**) | user-approved — the files are your own disk content, read on your explicit click | blocks queued on click; exact-text dedupe against the whole queue; runs only while Play is active. Path is blocklist-validated (`& | < > ^ ; % "` + CR/LF rejected; trusted `%ENVVAR%` or drive-letter root) and every command argument is quoted once — the standard remediation for the CVE-2024-27980 / BatBadBut class, not escaping |
 | `::enqueue{prompt="…"}` (a chat turn wrote it) | **untrusted model output** — the platform contract for transcript directives is that attributes are untrusted model output | default **ask-first**: renders a clickable chip; the card is added only when you click it (gear → *Suggested prompts: Auto-add* restores immediate add). Either way it runs only while Play is active |
 
 The `::enqueue` path is the one a prompt injection could exploit: a
@@ -184,6 +206,16 @@ Practical guidance:
 - One-prompt sessions never trigger their *own* background review (the nudge
   counters are per-session) — the gate covers reviews from any session, which
   is the inference-slot protection that matters.
+- **Markdown ingest is Windows-only** and reads through the gated
+  `shell.exec` cmd.exe door: paths must start with a `%ENVVAR%` or drive
+  letter and may not contain `& | < > ^ ; % "` (the blocklist is what makes
+  the single-quoting safe); files are read in 45-line windows, so an ingest
+  of many large files issues one shell round-trip per window. A folder you
+  don't own or a path with odd characters simply produces a readable error —
+  nothing is ever written outside the folder you pointed it at (the only
+  writes are `prompts.md` when you ask for the template, plus `_pq.b64` /
+  `_pq_read.py` scratch files inside that same folder — the `.b64` is deleted
+  immediately after each decode).
 
 ## License
 

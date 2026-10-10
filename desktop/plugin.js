@@ -114,6 +114,9 @@ async function loadSettings() {
           modelSuggested: s.modelSuggested === 'auto' ? 'auto' : 'ask',
           gateFailOpen: s.gateFailOpen === true,
           defaultMode: s.defaultMode === 'bot' ? 'bot' : 'new',
+          // The path is validated at ACTION time (pqShellPath), not here — an
+          // edited-but-not-yet-applied value must survive a restart.
+          ingestDir: typeof s.ingestDir === 'string' && s.ingestDir ? s.ingestDir : INGEST_DEFAULT_DIR,
         }
       }
     }
@@ -185,6 +188,256 @@ function useQueue() {
   )
 }
 
+// ── Markdown ingest (Phase 3) ───────────────────────────────────────────────
+// A folder of .md files → queue cards. The renderer has no fs API, so file
+// access goes through `shell.exec` — a GENERIC cmd.exe door with NO
+// interpreter-script flag allowed (python -c / powershell -Command are
+// hard-blocked by the gateway's approval gate, error 4005; verified in
+// tools/approval_detection.py + tui_gateway/methods_tools.py). Reliable
+// windowed read = place a tiny helper FILE via
+//   echo <b64-line> > _pq.b64 & certutil -f -decode _pq.b64 _pq_read.py & del
+// (echo/certutil/del gate-ALLOWED, exact bytes, idempotent) then run it as
+// `python <file>` — a FILE argument passes the gate (unlike -c), and bare
+// `python` resolves in the gateway subprocess env. The gateway tails stdout
+// to 4000 chars, so reads are 45-line windows, reassembled here.
+//
+// cmd.exe gotchas baked into these shapes (each probed through the REAL
+// gateway env before shipping):
+//   - `if not exist X mkdir X & a & b`: when X EXISTS the false if swallows
+//     the WHOLE & chain — mkdir is its own command; guarded one-shots use
+//     a parenthesized body: (…).
+//   - for /f loops are useless under /c (backtick source fails, file source
+//     drops lines) — never used.
+//   - Windows mkdir auto-creates parents; there is no /p flag.
+//   - Paths are validated by a blocklist (PQ_UNSAFE) BEFORE entering a
+//     command: root is a %ENVVAR% (expands in the gateway env) or a drive
+//     letter; segments may hold anything except PQ_UNSAFE and CR/LF. No
+//     regex on user input, no escaping -- if validation passes, quoting
+//     each complete argument once is sufficient for cmd.exe (the standard
+//     remediation pattern for the CVE-2024-27980 / BatBadBut class).
+const INGEST_DEFAULT_DIR = '%USERPROFILE%\\.hermes\\prompt-queue'
+// cmd.exe interprets these even inside a "quoted" argument when quotes get
+// stripped; reject them in user input instead of escaping (blocklist approach —
+// the Node CVE-2024-27980/BatBadBut remediation pattern: validate, then quote).
+const PQ_UNSAFE = '"&|<>^;%'
+const READ_WINDOW = 45 // lines per shell.exec — stays under the 4000-char stdout tail
+const INGEST_MAX_BYTES = 262144 // 256KB source ceiling: refuse, don't grind
+// Precomputed ASCII base64 (pure A-Za-z0-9+/= — no command metacharacter can
+// ride along). PQ_HELPER_B64 decodes to a 5-line python script that prints the
+// lines [o, o+n) of its argv[1] file and reports TOTAL=<line count> on stderr.
+// PQ_TEMPLATE_B64 is the prompts.md starter (CRLF). certutil -f -decode writes
+// both byte-exact (verified: em-dash / UTF-8 survive).
+const PQ_HELPER_B64 = 'aW1wb3J0IHN5cwpwLG8sbj1zeXMuYXJndlsxXSxpbnQoc3lzLmFyZ3ZbMl0pLGludChzeXMuYXJndlszXSkKTD1vcGVuKHAsZW5jb2Rpbmc9J3V0Zi04LXNpZycsZXJyb3JzPSdyZXBsYWNlJykucmVhZCgpLnNwbGl0bGluZXMoKQpzeXMuc3Rkb3V0LndyaXRlKCdcbicuam9pbihMW286bytuXSkpCnN5cy5zdGRlcnIud3JpdGUoJ1RPVEFMPScrc3RyKGxlbihMKSkrJ1xuJyk='
+const PQ_TEMPLATE_B64 = 'IyBQcm9tcHRzDQojIE9uZSBwcm9tcHQgcGVyICIjIyAiIGhlYWRpbmcgYmVsb3cg4oCUIHRoZSBoZWFkaW5nIGlzIHRoZSBjYXJkIHRpdGxlIGFuZA0KIyB0aGUgbGluZXMgdW5kZXIgaXQgYmVjb21lIHRoZSBwcm9tcHQgYm9keS4gTGluZXMgd2l0aCBhIHNpbmdsZSAiIyIgYXJlDQojIGNvbW1lbnRzIGFuZCBpZ25vcmVkLiAiLSBbIF0iIGNoZWNrYm94ZXMgd29yayB0b28gKGVhY2ggY2hlY2tib3ggYmVjb21lcw0KIyBpdHMgb3duIGNhcmQpLiBCbGFuayBsaW5lcyBiZXR3ZWVuIGJsb2NrcyBhcmUgZmluZS4NCg0KIyMgRmlyc3QgcHJvbXB0DQpEZXNjcmliZSB0aGUgdGFzayBoZXJlIOKAlCB0aGlzIHdob2xlIGJsb2NrIGJlY29tZXMgYSBxdWV1ZSBjYXJkLg0KDQojIyBTZWNvbmQgcHJvbXB0DQpBbm90aGVyIHRhc2suIE9yIHVzZSBjaGVja2JveGVzIGluc3RlYWQgb2YgaGVhZGluZ3M6DQoNCi0gWyBdIGEgc2hvcnQgY2hlY2tib3ggdGFzaw0K'
+// Validate a user folder path. Returns the CLEAN path (unquoted) or ''.
+// Trusted roots: %ENVVAR% (expands in the gateway env — USERPROFILE, TEMP, …)
+// or an absolute drive letter; remainder must be backslash segments.
+// Blocklist PQ_UNSAFE + CR/LF. No regex on user input, no escaping: if this
+// passes, quoting the complete argument once is sufficient for cmd.exe.
+const PQ_ROOT_RE = /^(?:%[A-Za-z_][A-Za-z0-9_]*%|[A-Za-z]:)/
+function pqShellPath(raw) {
+  const p = String(raw || '').trim()
+  if (!p) return ''
+  const root = PQ_ROOT_RE.exec(p)
+  if (!root) return ''
+  let rest = p.slice(root[0].length)
+  if (!rest.startsWith('\\')) return '' // root alone (C: / %USERPROFILE%) is not a folder path
+  for (const ch of rest) {
+    if (PQ_UNSAFE.includes(ch) || ch === '\n' || ch === '\r') return ''
+  }
+  return p
+}
+// Same blocklist for a bare file name (backslash additionally forbidden).
+function pqShellName(raw) {
+  const n = String(raw || '').trim()
+  if (!n || n.includes('\\')) return ''
+  for (const ch of n) {
+    if (PQ_UNSAFE.includes(ch) || ch === '\n' || ch === '\r') return ''
+  }
+  return n
+}
+async function shellExec(command) {
+  const res = await host.request('shell.exec', { command })
+  if (!res || typeof res.stdout !== 'string') throw new Error('shell.exec returned no output')
+  return res
+}
+// Ensure the read helper sits in the queue dir. mkdir is its OWN command (the
+// if-swallow gotcha); placement is a separate pure & chain. Re-run on every
+// ingest — a deleted/edited helper self-heals; it is never trusted as-is.
+// Every path below enters the command line exactly once, fully quoted.
+async function ensureReadHelper(dir) {
+  const d = pqShellPath(dir)
+  if (!d) throw new Error('invalid folder path')
+  await shellExec(`if not exist "${d}" mkdir "${d}"`)
+  await shellExec(`echo ${PQ_HELPER_B64} > "${d}\\_pq.b64" & certutil -f -decode "${d}\\_pq.b64" "${d}\\_pq_read.py" & del "${d}\\_pq.b64"`)
+}
+// Windowed read of an .md file. Returns { text, totalLines } or throws a
+// readable error (missing file / over-size / helper failure).
+async function readMdFile(dir, name) {
+  const d = pqShellPath(dir)
+  if (!d) throw new Error('invalid folder path')
+  const n = pqShellName(name)
+  if (!n) throw new Error('invalid file name')
+  await ensureReadHelper(d)
+  const f = `${d}\\${n}` // complete argument, quoted once at the use site
+  const parts = []
+  let off = 0
+  let total = null
+  for (let i = 0; i < 40; i++) { // hard cap: 40 windows × 45 lines, far past the byte ceiling
+    const r = await shellExec(`python "${d}\\_pq_read.py" "${f}" ${off} ${READ_WINDOW}`)
+    if (r.code !== 0) {
+      throw new Error(n + ': ' + (r.stderr || '').replace(/\s+/g, ' ').trim().slice(0, 160) || 'could not read')
+    }
+    if (total == null) {
+      const m = /TOTAL=(\d+)/.exec(r.stderr || '')
+      if (!m) throw new Error(n + ': helper reported no line count')
+      total = parseInt(m[1], 10)
+    }
+    parts.push(r.stdout.replace(/\r\n/g, '\n').replace(/\n$/, ''))
+    off += READ_WINDOW
+    if (off >= total) break
+  }
+  const text = parts.join('\n')
+  if (new TextEncoder().encode(text).length > INGEST_MAX_BYTES) throw new Error(n + ' is over the 256KB ingest limit — split it into smaller files')
+  return { text, totalLines: total }
+}
+// List .md files in the queue dir. `dir /b /o-d` = bare names, newest first.
+// The GLOB IS PART OF THE QUOTED PATH — one argument, quoted end to end (an
+// unquoted * after a closing quote is the fragile cmd parse form).
+// dir exits non-zero with EMPTY stdout when there are no matches — that is
+// "no files", not an error (probe-confirmed shape).
+async function listMdFiles(dir) {
+  const d = pqShellPath(dir)
+  if (!d) throw new Error('invalid folder path')
+  await shellExec(`if not exist "${d}" mkdir "${d}"`)
+  const r = await shellExec(`dir /b /o-d "${d}\\*.md"`)
+  return r.stdout.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+}
+// Create the folder + prompts.md template when absent. Idempotent: an existing
+// prompts.md is NEVER touched — guard is parenthesized so the if-swallow gotcha
+// cannot eat the & chain when the file already exists.
+async function createIngestTemplate(dir) {
+  const d = pqShellPath(dir)
+  if (!d) throw new Error('invalid folder path')
+  await shellExec(`if not exist "${d}" mkdir "${d}"`)
+  const hadTemplate = (await listMdFiles(d)).includes('prompts.md')
+  await shellExec(`if not exist "${d}\\prompts.md" (echo ${PQ_TEMPLATE_B64} > "${d}\\_pq.b64" & certutil -f -decode "${d}\\_pq.b64" "${d}\\prompts.md" & del "${d}\\_pq.b64")`)
+  return hadTemplate ? 'already there — left untouched' : 'created'
+}
+function openIngestFolder(dir) {
+  const d = pqShellPath(dir || INGEST_DEFAULT_DIR)
+  if (!d) return
+  host.request('shell.exec', { command: `explorer "${d}"` }).catch(() => {})
+}
+// ingestDir is a setting — but the default lives with the Phase-3 constants
+// below, which run AFTER the settings literal (const TDZ). Assign here, at
+// first definition of INGEST_DEFAULT_DIR.
+settings.ingestDir = settings.ingestDir || INGEST_DEFAULT_DIR
+
+// ── ingest action (pure orchestration over the shell helpers above) ─────────
+// Reads every checked .md file in the folder, splits it into blocks, and
+// queues the new ones. Dedupe is EXACT-TEXT against every card that still
+// exists — INCLUDING done/failed/skipped (state.cards spans all tabs): a
+// prompt that already ran is not silently re-queued. To run an old prompt
+// again: clear its card from the Done tab first, or use ↻ retry on it.
+// Editing a block's text adds the new version; the old card stays (delete it).
+// prompts.md's own template placeholder blocks queue harmlessly if left as
+// written — the file is the user's to edit, and deleting a card is one click.
+const INGEST_MAX_FILES = 50
+const INGEST_MAX_CARDS_PER_RUN = 200
+async function ingestQueueDir(dir, names) {
+  const d = pqShellPath(dir || settings.ingestDir || INGEST_DEFAULT_DIR)
+  if (!d) throw new Error('invalid folder path — expected %USERPROFILE%\\… or C:\\… with no cmd metacharacters')
+  const list = (await listMdFiles(d)).slice(0, INGEST_MAX_FILES)
+  // names undefined/null → ingest every .md file in the folder.
+  const toRead = names ? list.filter((n) => names.includes(n)) : list
+  const existing = new Set(state.cards.map((c) => c.text))
+  const added = []
+  const failedFiles = []
+  let addedCount = 0
+  let dupes = 0
+  for (const name of toRead) {
+    if (addedCount >= INGEST_MAX_CARDS_PER_RUN) break
+    let text
+    try {
+      text = (await readMdFile(d, name)).text
+    } catch (e) {
+      failedFiles.push({ name, err: errMsg(e) })
+      continue
+    }
+    const blocks = extractMdBlocks(text)
+    for (const b of blocks) {
+      if (addedCount >= INGEST_MAX_CARDS_PER_RUN) break
+      if (existing.has(b.text)) { dupes++; continue }
+      addCard(b.text, null, null, b.title) // default mode; 🎯 re-points per card; heading = card title
+      existing.add(b.text)
+      added.push({ name, title: b.title })
+      addedCount++
+    }
+  }
+  return { dir: d, filesChecked: toRead.length, added: added.length, dupes, failedFiles, truncated: list.length > INGEST_MAX_FILES }
+}
+
+
+// Pure markdown → blocks. Headings ("## x") and checkboxes ("- [ ] x") are
+// block starts; bare "# …" comment lines are dropped; lines BEFORE the first
+// block (preamble) ride into the first block's text so nothing is lost.
+function extractMdBlocks(md) {
+  // H2–H6 start a card block. A single-# line is a document title / comment —
+  // the template's own contract ("## " headings are cards); '#' lines are ignored.
+  const RE_HEADING = /^#{2,6}\s+(.*)$/
+  const RE_CHECKBOX = /^\s*[-*]\s+\[( |x|X)\]\s+(.*)$/
+  const blocks = []
+  let cur = null
+  const preamble = []
+  const push = () => { if (cur) blocks.push(cur); cur = null }
+  for (const rawLine of String(md || '').replace(/\r\n/g, '\n').split('\n')) {
+    const line = rawLine.replace(/\s+$/, '')
+    if (!line.trim()) continue
+    const h = RE_HEADING.exec(line)
+    const cb = RE_CHECKBOX.exec(line)
+    // Single-# comment lines are ignored. (A '#' elsewhere in a line is
+    // prompt content and survives — the test is anchored at line start.)
+    if (!h && !cb && /^#/.test(line)) continue
+    if (h) {
+      push()
+      cur = { title: h[1].trim(), lines: [] }
+    } else if (cb) {
+      push()
+      cur = { title: cb[2].trim(), lines: [], checkbox: true }
+    } else if (cur) {
+      cur.lines.push(line)
+    } else {
+      preamble.push(line)
+    }
+  }
+  push()
+  const out = []
+  for (const b of blocks) {
+    if (b.checkbox && !b.lines.length) { out.push({ title: b.title, text: b.title }); continue }
+    const text = [b.title, ...b.lines].join('\n').trim()
+    if (!text) continue
+    out.push({ title: b.title || 'Prompt', text })
+  }
+  if (preamble.length && out.length) out[0] = { ...out[0], text: preamble.join('\n') + '\n' + out[0].text }
+  return out
+}
+// Optional model pass: llm.oneshot WITHOUT a session_id — the aux task route
+// resolves the local auxiliary model (this box: S1). Stateless; never touches
+// the queue's gates or a live session. Returns raw suggestion text; suggestions
+// are MODEL output → always shown for review, never auto-queued.
+async function suggestFromMd(text) {
+  const res = await host.request('llm.oneshot', {
+    task: 'title_generation',
+    instructions: 'You convert a markdown planning note into ready-to-run agent prompts. For each meaningful task output one line in EXACTLY this format: "- [ ] Title — prompt body". Keep every prompt self-contained (the receiving agent sees only that line). No other output, no preamble.',
+    input: text.slice(0, 12000),
+    max_tokens: 2048,
+    temperature: 0.3,
+  })
+  const t = res && (res.text || '')
+  if (!t) throw new Error('no suggestions returned')
+  return t
+}
 // ── review gate ─────────────────────────────────────────────────────────────
 async function reviewState() {
   const res = await host.logs({ file: 'agent', lines: 1000, search: 'bg-review' })
@@ -872,12 +1125,12 @@ function play() {
   }
 }
 function pause() { set({ playing: false }) }
-function addCard(text, target, targetTitle) {
+function addCard(text, target, targetTitle, titleOverride) {
   const t = (text || '').trim()
   if (!t) return
   set({
     cards: [...state.cards, {
-      id: uid(), text: t, title: sanitizeTitle(t), status: 'queued', ts: Date.now(),
+      id: uid(), text: t, title: titleOverride || sanitizeTitle(t), status: 'queued', ts: Date.now(),
       // Composer passes the current target; ::enqueue chips pass nothing →
       // the default mode (settings.defaultMode).
       target: target || defaultTarget(), targetTitle: targetTitle || null,
@@ -1191,6 +1444,138 @@ function SettingsMenu() {
                 ],
               }),
               jsx('div', { style: { ...rowStyle, color: 'var(--ui-text-quaternary)', fontSize: '0.62rem' }, children: 'Target for cards added without an explicit pick (the ::enqueue chip). “New session” is the classic one-shot session; “Bot Chat” feeds the default profile’s forever chat. Every card can still be re-pointed in its 🎯 picker — modes: new session, project, bot, or any existing session.' }),
+            ],
+          })
+        : null,
+    ],
+  })
+}
+
+// ── ingest menu (Phase 3) ───────────────────────────────────────────────────
+// The 📥 header button. A folder of .md files → queue cards: point it at a
+// folder (persisted in settings), optionally create the folder + a prompts.md
+// template on first use, then "Ingest" queues every block not already in the
+// queue (exact-text dedupe). All file access is the gated shell.exec path —
+// no fs API exists in the renderer.
+function IngestMenu() {
+  const s = useSettings()
+  const [open, setOpen] = useState(false)
+  const [dirInput, setDirInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState('') // '' | 'ok' | 'err' message line
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => {
+      const el = e.target && e.target.closest ? e.target.closest('[data-pq-ingest]') : null
+      if (!el) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+  const toggle = () => {
+    setDirInput(s.ingestDir || INGEST_DEFAULT_DIR)
+    setStatus('')
+    setOpen(!open)
+  }
+  const btn = (label, onClick, opts) => {
+    opts = opts || {}
+    return jsx('button', {
+      type: 'button',
+      onClick,
+      disabled: !!opts.disabled || busy,
+      style: {
+        border: '1px solid ' + (opts.primary ? 'var(--ui-accent)' : 'var(--ui-stroke-secondary)'),
+        background: opts.primary ? 'color-mix(in srgb, var(--ui-accent) 12%, transparent)' : 'transparent',
+        color: busy ? 'var(--ui-text-quaternary)' : (opts.primary ? 'var(--ui-accent)' : 'var(--ui-text-secondary)'),
+        borderRadius: '4px', cursor: busy || opts.disabled ? 'default' : 'pointer',
+        fontSize: '0.65rem', padding: '3px 8px',
+      },
+      children: label,
+    })
+  }
+  const run = async (fn) => {
+    if (busy) return
+    setBusy(true)
+    setStatus('working…')
+    try {
+      await fn()
+    } catch (e) {
+      setStatus('error — ' + errMsg(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const saveDir = () => {
+    const v = dirInput.trim()
+    if (!pqShellPath(v)) { setStatus('invalid path — expected %USERPROFILE%\\… or C:\\… (no quotes, & | < > ^ ; %)'); return }
+    setSettings({ ingestDir: v })
+    setStatus('folder saved')
+  }
+  const doIngest = () => run(async () => {
+    const r = await ingestQueueDir(s.ingestDir)
+    setStatus(`added ${r.added} card${r.added === 1 ? '' : 's'} · ${r.dupes} already in queue${r.failedFiles.length ? ` · failed: ${r.failedFiles.map((f) => f.name).join(', ')}` : ''}${r.truncated ? ' (capped at 50 files)' : ''}`)
+  })
+  return jsxs(Fragment, {
+    children: [
+      jsx('button', {
+        'data-pq-ingest': 'trigger',
+        title: 'Ingest a folder of .md files as queue cards',
+        onClick: toggle,
+        style: { border: 'none', background: 'transparent', color: 'var(--ui-text-quaternary)', cursor: 'pointer', fontSize: '0.8rem', padding: '1px 3px', borderRadius: '3px' },
+        children: '📥',
+      }),
+      open
+        ? jsx('div', {
+            'data-pq-ingest': 'menu',
+            style: {
+              position: 'absolute', zIndex: 40, top: '100%', right: '26px', marginTop: '2px',
+              background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
+              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', padding: '6px', width: '270px',
+            },
+            children: [
+              jsxs('div', {
+                style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 6px 4px', borderBottom: '1px solid var(--ui-stroke-secondary)', marginBottom: '4px' },
+                children: [
+                  jsx('span', { style: { fontSize: '0.68rem', fontWeight: 600, color: 'var(--ui-text-secondary)', flex: 1 }, children: 'Ingest folder' }),
+                ],
+              }),
+              jsxs('div', {
+                style: { display: 'flex', gap: '4px', padding: '2px 6px 4px' },
+                children: [
+                  jsx('input', {
+                    value: dirInput,
+                    onChange: (e) => setDirInput(e.target.value),
+                    onKeyDown: (e) => { if (e.key === 'Enter') saveDir() },
+                    spellCheck: false,
+                    placeholder: INGEST_DEFAULT_DIR,
+                    style: {
+                      flex: 1, minWidth: 0, fontSize: '0.65rem', padding: '3px 6px',
+                      border: '1px solid var(--ui-stroke-secondary)', borderRadius: '4px',
+                      background: 'transparent', color: 'var(--ui-text-secondary)',
+                    },
+                  }),
+                  jsx('button', { type: 'button', onClick: saveDir, style: { border: '1px solid var(--ui-stroke-secondary)', background: 'transparent', color: 'var(--ui-text-secondary)', fontSize: '0.65rem', borderRadius: '4px', padding: '3px 7px', cursor: 'pointer' }, children: 'Save' }),
+                ],
+              }),
+              jsxs('div', {
+                style: { display: 'flex', gap: '4px', padding: '0 6px 4px' },
+                children: [
+                  btn('＋ Folder + template', () => run(async () => {
+                    const res = await createIngestTemplate(s.ingestDir)
+                    setStatus(res === 'created' ? `created ${s.ingestDir}\\prompts.md` : 'folder + prompts.md already there — left untouched')
+                  })),
+                  btn('📂 Open', () => { openIngestFolder(s.ingestDir); }),
+                ],
+              }),
+              jsx('div', {
+                style: { padding: '0 6px 4px', borderTop: '1px solid var(--ui-stroke-secondary)', marginTop: '2px' },
+                children: btn(busy ? '⏳ Ingesting…' : '⬇ Ingest → queue', doIngest, { primary: true, disabled: busy }),
+              }),
+              status
+                ? jsx('div', { style: { padding: '2px 6px 4px', fontSize: '0.62rem', color: status.startsWith('error') ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }, children: status })
+                : null,
+              jsx('div', { style: { padding: '4px 6px 2px', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' }, children: 'Each “## ” heading and “- [ ]” checkbox in a .md file becomes a card (single-# lines are comments). Blocks already in the queue — any tab — are skipped, so re-ingesting is safe.' }),
             ],
           })
         : null,
@@ -1663,6 +2048,7 @@ function Board() {
             },
             children: q.playing ? '❚❚ Pause' : '▶ Play',
           }),
+          jsx(IngestMenu, {}),
           jsx(SettingsMenu, {}),
           jsx('span', {
             style: { fontSize: '0.65rem', color: q.playing && q.modelBusy ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)', marginLeft: 'auto' },

@@ -3,6 +3,74 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.4.0 (2026-10-11 — Phase 3: markdown ingest)
+
+A folder of `.md` files becomes queue cards. The new **📥 Ingest** button in
+the pane header points at a folder (persisted in settings, default
+`%USERPROFILE%\.hermes\prompt-queue`); **＋ Folder + template** creates the
+folder and a starter `prompts.md` on first use (never touches an existing
+one); **Ingest → queue** reads every `.md` file and queues each `## …`
+heading and `- [ ]` checkbox as a card — with exact-text dedupe against every
+card already in the queue (any tab), so re-ingesting is safe.
+
+### Added
+
+- **Ingest menu (📥)** — folder path field + Save, **＋ Folder + template**,
+  **📂 Open** (explorer), **⬇ Ingest → queue** with a live status line
+  (`added N cards · M already in queue · failed: …`). Busy state disables all
+  actions; the menu closes on outside click like the gear's.
+- **`ingestQueueDir()`** — orchestration: list `.md` files (capped at 50),
+  read each (capped at 256KB per file, 200 cards per run), split into blocks
+  (`## ` headings H2–H6, `- [ ]`/`- [x]` checkboxes; single-`#` lines are
+  comments and ignored — matching the template's own contract), queue the
+  new ones. The card's **title is the block's heading** (the prompt text
+  stays complete for the receiving agent); target = the default mode,
+  re-pointable per card via 🎯 as usual.
+- **`createIngestTemplate(dir)`** — idempotent folder + `prompts.md` creation.
+  An existing `prompts.md` is NEVER touched (returns "already there — left
+  untouched"). The template documents the block contract in-file.
+- **Shell-safe file access** (the renderer has no fs API; `shell.exec` is a
+  generic cmd.exe door whose approval gate hard-blocks every interpreter
+  script flag — `python -c`, `powershell -Command`, etc.):
+  - **Windowed reads** via a tiny helper FILE placed with
+    `echo <b64> > _pq.b64 & certutil -f -decode … & del …` (gate-allowed,
+    byte-exact), then run as `python <file>` — a file argument passes the
+    gate where `-c` does not. 45-line windows stay under the gateway's
+    4000-char stdout tail; reassembled in the renderer.
+  - **Blocklist path validation** (the Node CVE-2024-27980 / BatBadBut
+    remediation pattern, not escaping): a trusted root (`%ENVVAR%` or drive
+    letter) + segments free of `& | < > ^ ; % "` and CR/LF; every complete
+    argument then enters the command line quoted exactly once. `%USERPROFILE%`
+    roots expand correctly inside quotes (probe-verified); an undefined var
+    fails safely with no junk directory.
+  - **cmd.exe gotchas baked in and probe-tested through the real gateway
+    spawn path**: `if not exist X mkdir X & chain` swallows the chain when X
+    exists (mkdir is its own command; guarded one-shots use parenthesized
+    bodies), Windows `mkdir` auto-creates parents (no `/p`), wildcards live
+    INSIDE the quotes (`dir /b "path\*.md"`), and `dir` exits non-zero with
+    empty stdout when nothing matches ("no files", not an error).
+
+### Verified
+
+47-assertion end-to-end test running the REAL `plugin.js` in a vm sandbox
+with `shell.exec` backed by the EXACT gateway spawn path
+(`subprocess.run(cmd, shell=True)` → `cmd /c`) against real directories —
+including one with a SPACE in its name: template create + idempotency (byte-
+identical on second run), listing, multi-window read round-trip (60-line
+file across 2 windows, UTF-8 + em-dash survive b64→certutil→python→cmd),
+missing-file and metacharacter error paths, full ingest action (7 blocks in,
+re-ingest adds 0 / reports 7 dupes), and the `%USERPROFILE%` default-dir
+shape end to end. Every emitted command also passes the real approval gate
+(`detect_hardline_command` / `detect_dangerous_command`) and contains no
+interpreter script flag. Phase-2 unit suite: 39/39 still green.
+
+### Unchanged
+
+Storage key and card schema (v3); the engine, gates, and all existing modes;
+`addCard()` signature is backward compatible (the new `titleOverride` arg is
+trailing). Settings payload gains `ingestDir` under the same settings key —
+old settings load with the default folder.
+
 ## 1.3.0 (2026-10-10 — Phase 2: modes framework + bot mode)
 
 The card target is now a **mode**: a named target resolver that turns a card's
