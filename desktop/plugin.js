@@ -1590,7 +1590,8 @@ function IngestMenu() {
 // inline form) / Bots (profiles' canonical Bot Chat) / sessions (latest 10
 // with a reply) / manual session ID.
 function TargetPicker({ value, trigger, onSelect }) {
-  const [open, setOpen] = useState(false)
+  const [openA, setOpenA] = useState(false)   // row 1 — the destination KIND menu
+  const [openB, setOpenB] = useState(false)   // row 2 — the concrete TARGET menu
   const [goUp, setGoUp] = useState(false)
   const [manual, setManual] = useState('')
   const [manualErr, setManualErr] = useState('')
@@ -1601,240 +1602,193 @@ function TargetPicker({ value, trigger, onSelect }) {
   const [projName, setProjName] = useState('')
   const [projPath, setProjPath] = useState('')
   const boxRef = useRef(null)
-  // On open: measure the trigger against the viewport and flip the menu
-  // upward when it would run past the bottom of the window. This is why the
-  // composer picker opens up (it sits at the pane's bottom) and a card's
-  // picker near the top still opens down.
-  const toggleOpen = () => {
-    if (!open) {
-      try {
-        const r = boxRef.current && boxRef.current.getBoundingClientRect()
-        if (r) setGoUp(r.bottom + 240 + 12 > (window.innerHeight || 768))
-      } catch { /* */ }
-    }
-    setOpen(!open)
+
+  // Two-row design: row 1 picks the destination KIND (a mode), row 2 picks the
+  // concrete target within that kind. activeKind drives which row-2 list shows.
+  // It is seeded from value and re-synced whenever the value prop changes
+  // (hydrate / card switch / commit) — but merely arming a different kind does
+  // NOT change value, so that sync can't yank an in-progress "pick the kind
+  // first" flow back. A target is COMMITTED when its mode matches activeKind;
+  // until then row 2 shows a "choose…" hint and value keeps the last valid one.
+  const [activeKind, setActiveKind] = useState(() => modeOf(value))
+  useEffect(() => { setActiveKind(modeOf(value)) }, [value])
+  const committed = modeOf(value) === activeKind
+  const wide = !trigger
+
+  const measureFlip = () => {
+    try {
+      const r = boxRef.current && boxRef.current.getBoundingClientRect()
+      if (r) setGoUp(r.bottom + 260 + 12 > (window.innerHeight || 768))
+    } catch { /* */ }
   }
+  const toggleA = () => { if (!openA && !openB) measureFlip(); setOpenA(!openA); setOpenB(false) }
+  const toggleB = () => { if (activeKind === 'new') return; if (!openA && !openB) measureFlip(); setOpenB(!openB); setOpenA(false) }
+
   useEffect(() => {
-    if (!open) return
-    refreshSessionList(true).then((list) => setSessions(list.slice(0, PICKER_SHOW)))
-    refreshProjectList(true).then((list) => setProjects(list))
-    refreshProfileList(true).then((list) => setProfiles(list))
-    return undefined
-  }, [open])
-  useEffect(() => {
-    if (!open) return
-    const onDoc = (e) => {
-      if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false)
-    }
+    if (!openA && !openB) return undefined
+    const onDoc = (e) => { if (boxRef.current && !boxRef.current.contains(e.target)) { setOpenA(false); setOpenB(false) } }
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
-  }, [open])
-  const projRef = projectOf(value)
-  const botRef = typeof value === 'string' && value.startsWith(BOT_TARGET_PREFIX) ? value.slice(BOT_TARGET_PREFIX.length).trim() : null
-  const currentTitle = value === 'new' ? 'New session'
-    : botRef != null ? (botRef || 'default') + " · Bot Chat"
-    : projRef ? (projectTitle({ target: value, targetTitle: projRef.id ? value : null }) || value)
-    : (sessions.find((s) => s.id === value) || {}).title || value
-  const pick = (v, title) => { onSelect(v, title); setOpen(false) }
-  const submitNewProject = () => {
-    const path = projPath.trim()
-    if (!path) return
-    pick(NEW_PROJECT_PREFIX + path, projName.trim())
-    setNewProj(false); setProjName(''); setProjPath('')
+  }, [openA, openB])
+
+  // Refresh the three lists whenever either menu opens (fail-open to cache).
+  useEffect(() => {
+    if (!openA && !openB) return undefined
+    let alive = true
+    refreshSessionList(true).then((l) => { if (alive) setSessions(l.slice(0, PICKER_SHOW)) })
+    refreshProjectList(true).then((l) => { if (alive) setProjects(l) })
+    refreshProfileList(true).then((l) => { if (alive) setProfiles(l) })
+    return () => { alive = false }
+  }, [openA, openB])
+
+  const closeAll = () => { setOpenA(false); setOpenB(false) }
+  const pick = (v, title) => { onSelect(v, title); closeAll(); setManual(''); setManualErr(''); setNewProj(false) }
+
+  const KINDS = [
+    { k: 'new', icon: '+', label: 'New session' },
+    { k: 'project', icon: '\u{1F4C1}', label: 'Project' },
+    { k: 'bot', icon: '\u{1F916}', label: 'Bot' },
+    { k: 'session', icon: '\u21A9', label: 'Session' },
+  ]
+  const kindMeta = (k) => KINDS.find((x) => x.k === k) || KINDS[0]
+
+  // Row-2 chip text for the current activeKind.
+  let row2 = { text: '', warn: false }
+  if (activeKind === 'new') row2 = { text: 'fresh session \u00B7 closes after run', warn: false }
+  else if (!committed) row2 = { text: 'choose a ' + activeKind + '\u2026', warn: true }
+  else if (activeKind === 'project') {
+    const ref = projectOf(value)
+    if (ref && ref.id === null) row2 = { text: '\u2728 new \u00B7 ' + ref.path, warn: false }
+    else {
+      const p = ref ? projects.find((x) => x.id === ref.id) : null
+      row2 = { text: (p && p.name) || String(value).slice(PROJECT_TARGET_PREFIX.length), warn: false }
+    }
+  } else if (activeKind === 'bot') {
+    row2 = { text: (String(value).slice(BOT_TARGET_PREFIX.length).trim() || 'default') + ' \u00B7 Bot Chat', warn: false }
+  } else {
+    const s = sessions.find((x) => x.id === value)
+    row2 = { text: s ? s.title : String(value), warn: false }
   }
-  const modePrefix = { project: '📁 ', bot: '🤖 ', session: '→ ', new: '＋ ' }[modeOf(value)] || ''
-  const btnLabel = trigger || (value === undefined ? '🎯 target' : (value === 'new' ? '🎯 New session' : `🎯 ${modePrefix}${currentTitle}`))
+
+  const rowBtnStyle = (accent) => ({
+    display: 'flex', alignItems: 'center', gap: '5px', width: wide ? '100%' : 'auto', maxWidth: '100%',
+    border: '1px solid ' + (accent ? 'var(--ui-accent)' : 'var(--ui-stroke-secondary)'), borderRadius: '5px',
+    background: accent ? 'color-mix(in srgb, var(--ui-accent) 12%, transparent)' : 'transparent',
+    color: 'var(--ui-text-secondary)', fontSize: wide ? '0.6875rem' : '0.625rem',
+    padding: wide ? '4px 7px' : '3px 6px', cursor: 'pointer',
+  })
+  const midStyle = { flex: 1, textAlign: 'left', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
+  const caretStyle = { color: 'var(--ui-text-quaternary)', flexShrink: 0, fontSize: '0.55rem' }
+  const menuWrapStyle = (extra) => Object.assign({
+    position: 'absolute', zIndex: 30, left: 0,
+    ...(goUp ? { bottom: '100%', marginBottom: '2px' } : { top: '100%', marginTop: '2px' }),
+    background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
+    border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
+    boxShadow: '0 8px 24px rgba(0,0,0,0.35)', overflowY: 'auto',
+  }, wide ? { right: 0 } : {}, extra || {})
+
   const rowStyle = { padding: '5px 9px', fontSize: '0.7rem', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
-  const sectionLabel = '— '
+  const sectionLabel = '\u2014 '
+  const hdrStyle = { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 }
+  const noteStyle = { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }
+  const inputBase = { fontSize: '0.65rem', padding: '3px 6px', border: '1px solid var(--ui-stroke-secondary)', borderRadius: '4px', background: 'transparent', color: 'var(--ui-text-secondary)', boxSizing: 'border-box' }
+
+  const projIs = (id) => { if (!committed) return false; const r = projectOf(value); return !!(r && r.id === id) }
+  const botIs = (name) => committed && String(value).slice(BOT_TARGET_PREFIX.length).trim() === name
+
+  // \u2014 Row-1 menu: the four destination kinds. \u2014
+  const menuA = openA ? jsx('div', {
+    style: menuWrapStyle({ maxHeight: '240px', minWidth: wide ? undefined : '180px' }),
+    children: KINDS.map((kd) => jsxs('div', {
+      key: kd.k,
+      onClick: () => {
+        if (kd.k === 'new') { setActiveKind('new'); pick('new', null) }
+        else { setActiveKind(kd.k); setOpenA(false); setOpenB(true) }
+      },
+      style: { ...rowStyle, color: activeKind === kd.k ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: activeKind === kd.k ? 600 : 400 },
+      children: [kd.icon + ' ', kd.label],
+    })),
+  }) : null
+
+  // \u2014 Row-2 menu content, by activeKind. \u2014
+  let menuB = null
+  if (openB) {
+    if (activeKind === 'project') {
+      const submitNew = () => { if (projPath.trim()) pick(NEW_PROJECT_PREFIX + projPath.trim(), projName.trim()) }
+      menuB = jsx('div', { style: menuWrapStyle({ maxHeight: '320px', minWidth: wide ? undefined : '280px' }), children: [
+        jsxs('div', { style: hdrStyle, children: [sectionLabel, 'Project', sectionLabel] }),
+        projects.length === 0
+          ? jsx('div', { style: noteStyle, children: 'No projects yet \u2014 add one below' })
+          : projects.map((p) => jsxs('div', {
+              key: p.id, title: p.path || p.name, onClick: () => pick(PROJECT_TARGET_PREFIX + p.id, p.name),
+              style: { ...rowStyle, color: projIs(p.id) ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: projIs(p.id) ? 600 : 400 },
+              children: ['\u{1F4C1} ', p.name],
+            })),
+        jsxs('div', { onClick: () => setNewProj(!newProj), style: rowStyle, children: [newProj ? '\u25BE ' : '+ ', 'New project\u2026'] }),
+        newProj ? jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px', padding: '4px 9px 6px' }, children: [
+          jsx('input', { value: projName, onChange: (e) => setProjName(e.target.value), placeholder: 'Name (optional \u2014 defaults to the folder name)', style: { ...inputBase, width: '100%' } }),
+          jsxs('div', { style: { display: 'flex', gap: '4px' }, children: [
+            jsx('input', { value: projPath, onChange: (e) => setProjPath(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') submitNew() }, placeholder: '\u2026/folder path (must exist)', style: { ...inputBase, flex: 1, minWidth: 0 } }),
+            jsx('button', { type: 'button', onClick: submitNew, disabled: !projPath.trim(), style: { border: '1px solid var(--ui-stroke-secondary)', background: 'transparent', color: projPath.trim() ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)', fontSize: '0.65rem', borderRadius: '4px', padding: '3px 7px', cursor: projPath.trim() ? 'pointer' : 'default' }, children: 'Create' }),
+          ] }),
+        ] }) : null,
+      ] })
+    } else if (activeKind === 'bot') {
+      menuB = jsx('div', { style: menuWrapStyle({ maxHeight: '300px', minWidth: wide ? undefined : '240px' }), children: [
+        jsxs('div', { style: hdrStyle, children: [sectionLabel, 'Bot (profile Bot Chat)', sectionLabel] }),
+        profiles.length === 0
+          ? jsx('div', { style: noteStyle, children: 'No profiles on this backend' })
+          : profiles.map((pr) => jsxs('div', {
+              key: pr.name,
+              title: [pr.description, pr.model ? 'model: ' + pr.model : null, 'Runs into this profile\u2019s hidden \u201CBot Chat\u201D (created on first use if missing)'].filter(Boolean).join(' \u00B7 '),
+              onClick: () => pick(BOT_TARGET_PREFIX + pr.name, pr.name),
+              style: { ...rowStyle, color: botIs(pr.name) ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: botIs(pr.name) ? 600 : 400 },
+              children: ['\u{1F916} ', pr.name, pr.model ? ` \u00B7 ${pr.model}` : ''],
+            })),
+        jsx('div', { style: noteStyle, children: 'The prompt lands in the profile\u2019s one forever \u201CBot Chat\u201D \u2014 created on first use if missing.' }),
+      ] })
+    } else if (activeKind === 'session') {
+      menuB = jsx('div', { style: menuWrapStyle({ maxHeight: '320px', minWidth: wide ? undefined : '260px' }), children: [
+        jsxs('div', { style: hdrStyle, children: [sectionLabel, 'Session', sectionLabel] }),
+        sessions.length === 0
+          ? jsx('div', { style: noteStyle, children: 'No sessions with a reply yet' })
+          : sessions.map((s) => jsxs('div', {
+              key: s.id, title: s.id, onClick: () => pick(s.id, s.title),
+              style: { ...rowStyle, color: committed && value === s.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: committed && value === s.id ? 600 : 400 },
+              children: [s.title],
+            })),
+        jsxs('div', { style: { display: 'flex', gap: '4px', padding: '6px 7px', borderTop: '1px solid var(--ui-stroke-secondary)' }, children: [
+          jsx('input', { value: manual, onChange: (e) => { setManual(e.target.value); setManualErr('') }, placeholder: '\u2026or paste a session ID', style: { ...inputBase, flex: 1, minWidth: 0, borderColor: manualErr ? 'var(--ui-text-secondary)' : undefined } }),
+          jsx('button', { type: 'button', onClick: () => { const idm = manual.trim(); if (!/^\d{8}_\d{6}_[0-9a-f]{6}$/i.test(idm)) { setManualErr('expected YYYYMMDD_HHMMSS_hex6'); return } pick(idm, idm) }, style: { border: '1px solid var(--ui-stroke-secondary)', background: 'transparent', color: 'var(--ui-text-secondary)', fontSize: '0.65rem', borderRadius: '4px', padding: '3px 7px', cursor: 'pointer' }, children: 'Set' }),
+        ] }),
+        manualErr ? jsx('div', { style: { padding: '0 9px 6px', fontSize: '0.625rem', color: 'var(--ui-text-secondary)' }, children: manualErr }) : null,
+      ] })
+    }
+  }
+
+  const aMeta = kindMeta(activeKind)
+  const row2Icon = { project: '\u{1F4C1} ', bot: '\u{1F916} ', session: '\u21A9 ', new: '+ ' }[activeKind] || ''
+
   return jsxs('div', {
     ref: boxRef,
-    style: { position: 'relative', flex: trigger ? 'none' : 1 },
+    style: { position: 'relative', flex: trigger ? 'none' : 1, display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 },
     children: [
-      jsxs('button', {
-        type: 'button',
-        onClick: toggleOpen,
-        style: {
-          width: '100%', display: 'flex', alignItems: 'center', gap: '5px',
-          border: '1px solid var(--ui-stroke-secondary)', borderRadius: '5px',
-          background: 'transparent', color: 'var(--ui-text-secondary)',
-          fontSize: '0.6875rem', padding: '4px 7px', cursor: 'pointer',
-        },
-        children: [
-          jsx('span', {
-            style: { flex: 1, textAlign: 'left', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-            children: btnLabel,
-          }),
-          jsx('span', { style: { color: 'var(--ui-text-quaternary)', flexShrink: 0 }, children: '▾' }),
-        ],
-      }),
-      open
-        ? jsxs('div', {
-            style: {
-              position: 'absolute', zIndex: 30, left: 0, right: 0,
-              // goUp: measured on open — the menu grows UP from the trigger's
-              // top edge when opening downward would run past the window.
-              ...(goUp ? { bottom: '100%', marginBottom: '2px' } : { top: '100%', marginTop: '2px' }),
-              background: 'var(--ui-background, var(--ui-panel, #1c1c1e))',
-              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '6px',
-              boxShadow: '0 8px 24px rgba(0,0,0,0.35)', maxHeight: '280px', overflowY: 'auto',
-            },
-            children: [
-              jsxs('div', {
-                onClick: () => pick('new', null),
-                style: { ...rowStyle, color: value === 'new' ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: value === 'new' ? 600 : 400 },
-                children: ['＋ New session'],
-              }),
-              jsxs('div', {
-                style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
-                children: [sectionLabel, 'Project', sectionLabel],
-              }),
-              projects.length === 0
-                ? jsx('div', { style: { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No projects yet' })
-                : projects.map((p) =>
-                    jsxs('div', {
-                      key: p.id,
-                      title: p.path || p.name,
-                      onClick: () => pick(PROJECT_TARGET_PREFIX + p.id, p.name),
-                      style: {
-                        ...rowStyle,
-                        color: projRef && projRef.id === p.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
-                        fontWeight: projRef && projRef.id === p.id ? 600 : 400,
-                      },
-                      children: ['📁 ', p.name],
-                    }),
-                  ),
-              jsxs('div', {
-                onClick: () => setNewProj(!newProj),
-                style: { ...rowStyle, color: 'var(--ui-text-secondary)' },
-                children: [newProj ? '▾ ' : '＋ ', 'New project…'],
-              }),
-              newProj
-                ? jsxs('div', {
-                    style: { display: 'flex', flexDirection: 'column', gap: '4px', padding: '4px 9px 6px' },
-                    children: [
-                      jsx('input', {
-                        value: projName,
-                        onChange: (e) => setProjName(e.target.value),
-                        placeholder: 'Name (optional — defaults to the folder name)',
-                        style: {
-                          width: '100%', fontSize: '0.65rem', padding: '3px 6px',
-                          border: '1px solid var(--ui-stroke-secondary)', borderRadius: '4px',
-                          background: 'transparent', color: 'var(--ui-text-secondary)', boxSizing: 'border-box',
-                        },
-                      }),
-                      jsxs('div', {
-                        style: { display: 'flex', gap: '4px' },
-                        children: [
-                          jsx('input', {
-                            value: projPath,
-                            onChange: (e) => setProjPath(e.target.value),
-                            onKeyDown: (e) => { if (e.key === 'Enter') submitNewProject() },
-                            placeholder: '…/folder path (must exist)',
-                            style: {
-                              flex: 1, minWidth: 0, fontSize: '0.65rem', padding: '3px 6px',
-                              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '4px',
-                              background: 'transparent', color: 'var(--ui-text-secondary)',
-                            },
-                          }),
-                          jsx('button', {
-                            type: 'button',
-                            onClick: submitNewProject,
-                            disabled: !projPath.trim(),
-                            style: {
-                              border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
-                              color: projPath.trim() ? 'var(--ui-text-secondary)' : 'var(--ui-text-quaternary)',
-                              fontSize: '0.65rem', borderRadius: '4px', padding: '3px 7px',
-                              cursor: projPath.trim() ? 'pointer' : 'default',
-                            },
-                            children: 'Create',
-                          }),
-                        ],
-                      }),
-                    ],
-                  })
-                : null,
-              jsxs('div', {
-                style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
-                children: [sectionLabel, 'Bot (profile Bot Chat)', sectionLabel],
-              }),
-              profiles.length === 0
-                ? jsx('div', { style: { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No profiles on this backend' })
-                : null,
-              profiles.map((pr) =>
-                jsxs('div', {
-                  key: pr.name,
-                  title: [pr.description, pr.model ? 'model: ' + pr.model : null, "Runs into this profile's hidden \"Bot Chat\" (created on first use if missing)"].filter(Boolean).join(' · '),
-                  onClick: () => pick(BOT_TARGET_PREFIX + pr.name, pr.name),
-                  style: {
-                    ...rowStyle,
-                    color: botRef === pr.name ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
-                    fontWeight: botRef === pr.name ? 600 : 400,
-                  },
-                  children: ['🤖 ', pr.name, pr.model ? ` · ${pr.model}` : ''],
-                }),
-              ),
-              jsxs('div', {
-                style: { padding: '2px 9px 4px', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
-                children: ['The prompt lands in the profile’s one forever "Bot Chat" — name-as-identity, created on first use if missing.'],
-              }),
-              jsxs('div', {
-                style: { padding: '4px 9px 2px', fontSize: '0.625rem', color: 'var(--ui-text-quaternary)', fontWeight: 600 },
-                children: [sectionLabel, 'Session', sectionLabel],
-              }),
-              sessions.length === 0
-                ? jsx('div', { style: { padding: '2px 9px 3px', fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' }, children: 'No sessions with a reply yet' })
-                : null,
-              sessions.map((s) =>
-                jsxs('div', {
-                  key: s.id,
-                  title: s.id,
-                  onClick: () => pick(s.id, s.title),
-                  style: {
-                    ...rowStyle,
-                    color: value === s.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)',
-                    fontWeight: value === s.id ? 600 : 400,
-                  },
-                  children: [s.title],
-                }),
-              ),
-              jsxs('div', {
-                style: { display: 'flex', gap: '4px', padding: '6px 7px', borderTop: '1px solid var(--ui-stroke-secondary)' },
-                children: [
-                  jsx('input', {
-                    value: manual,
-                    onChange: (e) => { setManual(e.target.value); setManualErr('') },
-                    placeholder: '…or paste a session ID',
-                    style: {
-                      flex: 1, minWidth: 0, fontSize: '0.65rem', padding: '3px 6px',
-                      border: '1px solid ' + (manualErr ? 'var(--ui-text-secondary)' : 'var(--ui-stroke-secondary)'),
-                      borderRadius: '4px', background: 'transparent', color: 'var(--ui-text-secondary)',
-                    },
-                  }),
-                  jsx('button', {
-                    type: 'button',
-                    onClick: () => {
-                      const idm = manual.trim()
-                      if (!/^\d{8}_\d{6}_[0-9a-f]{6}$/i.test(idm)) {
-                        setManualErr('expected YYYYMMDD_HHMMSS_hex6')
-                        return
-                      }
-                      pick(idm, idm)
-                    },
-                    style: {
-                      border: '1px solid var(--ui-stroke-secondary)', background: 'transparent',
-                      color: 'var(--ui-text-secondary)', fontSize: '0.65rem',
-                      borderRadius: '4px', padding: '3px 7px', cursor: 'pointer',
-                    },
-                    children: 'Set',
-                  }),
-                ],
-              }),
-              manualErr
-                ? jsx('div', { style: { padding: '0 9px 6px', fontSize: '0.625rem', color: 'var(--ui-text-secondary)' }, children: manualErr })
-                : null,
-            ],
-          })
-        : null,
+      // Row 1 \u2014 the destination kind.
+      jsxs('div', { style: { position: 'relative' }, children: [
+        jsxs('button', { type: 'button', onClick: toggleA, style: rowBtnStyle(openA), children: [
+          jsx('span', { style: midStyle, children: aMeta.icon + ' ' + aMeta.label }),
+          jsx('span', { style: caretStyle, children: openA ? '\u25B4' : '\u25BE' }),
+        ] }),
+        menuA,
+      ] }),
+      // Row 2 \u2014 the concrete target for that kind (fixed note for new sessions).
+      jsxs('div', { style: { position: 'relative' }, children: [
+        jsxs('button', { type: 'button', onClick: toggleB, disabled: activeKind === 'new', style: rowBtnStyle(openB), children: [
+          jsx('span', { style: Object.assign({}, midStyle, row2.warn ? { color: 'var(--ui-text-quaternary)' } : {}), children: row2Icon + row2.text }),
+          activeKind !== 'new' ? jsx('span', { style: caretStyle, children: openB ? '\u25B4' : '\u25BE' }) : null,
+        ] }),
+        menuB,
+      ] }),
     ],
   })
 }
@@ -1886,6 +1840,7 @@ function CardRow({ c, onDragStart, onDropOn }) {
                 style: { display: 'flex', alignItems: 'center', gap: '5px', marginTop: '3px' },
                 children: [
                   jsx(TargetPicker, {
+                    value: c.target,
                     trigger: '🎯 target ▾',
                     onSelect: (v, t) => patchCard(c.id, {
                       target: v, targetTitle: t || null,
@@ -2160,10 +2115,10 @@ function Board() {
       jsxs('div', {
         style: { display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 8px', flexShrink: 0, minHeight: '90px', height: composerH },
         children: [
-          // Non-growing wrapper: TargetPicker's root is flex:1 (for CardRow's
-          // horizontal layout) — inside the fixed-height composer block that
-          // would stretch it to half the block, gapping it from the text box
-          // and mis-anchoring its menu. Wrap so it sits at its natural height.
+          // Non-growing wrapper: TargetPicker is two compact rows (kind +
+          // concrete target) at natural height — inside the fixed-height
+          // composer block a flex-grow root would stretch and gap from the
+          // text box, mis-anchoring its menus.
           jsx('div', {
             style: { flex: '0 0 auto', minWidth: 0 },
             children: jsx(TargetPicker, {
