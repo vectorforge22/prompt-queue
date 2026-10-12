@@ -3,6 +3,27 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.4.1 (2026-10-11 — two-row composer target picker)
+
+The single "🎯 target ▾" drop-down above the composer became **two stacked
+rows**: row 1 = destination kind (＋ New session / 📁 Project / 🤖 Bot /
+↩ Session), row 2 = the concrete target for that kind (project list + create
+form / bot profiles / sessions + manual-ID box; a fixed note for new
+sessions). Choosing a non-new kind opens row 2's menu immediately.
+
+- **Uncommitted targets can no longer happen**: until a row-2 pick commits,
+  the card keeps its last valid target and row 2 shows a "choose a …" hint —
+  the old menu could be closed mid-selection, leaving an ambiguous state.
+- Per-card pickers (the small "🎯 target ▾" in each card's meta row) now
+  receive `value` and render both rows compactly — they were blind before
+  and never showed which target that specific card had.
+- Preserved from the old menu: viewport flip, click-outside close, fail-open
+  caches, new-project create form, manual session-ID paste.
+
+Verification: picker smoke suite 13/13 (real component in a VM sandbox, all
+five target states + narrow mode), P2 logic 39/39, P3 e2e 47/47, validate
+passed.
+
 ## 1.4.0 (2026-10-11 — Phase 3: markdown ingest)
 
 A folder of `.md` files becomes queue cards. The new **📥 Ingest** button in

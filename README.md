@@ -58,6 +58,10 @@ without the next prompt fighting the background review for the inference slot
   **Default mode** (New session / Bot Chat) sets the target for cards added
   without an explicit pick (the `::enqueue` chip) and the composer's starting
   point — every card can still be re-pointed afterwards.
+- **Two-row target picker (composer)** — row 1 picks the destination kind
+  (＋ New session / 📁 Project / 🤖 Bot / ↩ Session), row 2 picks the
+  concrete target within it. An uncommitted pick never changes the card's
+  live target, so a card can't be left pointed at nothing.
 - **Markdown ingest (📥)** — point the pane header's 📥 menu at a folder of
   `.md` files (persisted; default `%USERPROFILE%\.hermes\prompt-queue`) and
   **⬇ Ingest → queue** turns each `## …` heading and `- [ ]` checkbox into a

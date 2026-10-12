@@ -1,5 +1,5 @@
 name: prompt-queue
-version: 1.4.0
+version: 1.4.1
 description: "Kanban-style prompt queue for the Hermes desktop app: Play drains cards one at a time into a per-card target MODE — new session, existing session, project (create-new supported), or a profile's canonical Bot Chat (bot mode) — gated on the global model slot and background-review completion. Queue/Done/Skipped/Failed tabs, resizable composer, per-card target picker, default-mode gear, trust-aware ::enqueue directive (ask-first by default), and markdown ingest: point the 📥 menu at a folder of .md files (template prompts.md created on first use) and queue every ## heading / - [ ] checkbox as a deduped card."
 author: "@vectorforge22"
 requires_hermes: ">=0.21.5"
