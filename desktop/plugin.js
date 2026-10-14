@@ -27,7 +27,9 @@
 // Renderer-only disk plugin (loaded uncompiled): only @hermes/plugin-sdk /
 // react / react/jsx-runtime resolve. UI is written with jsx() calls.
 //
-// State: ctx.storage JSON ({v, cards, playing}) — schema v3. Card:
+// State: ctx.storage JSON ({v, cards, playing, hydrate}) — schema v4.
+// `hydrate` = re-import diagnostics {n, at, inFlight, requeued}; a v3 payload
+// simply lacks it and hydrate() treats absence as the first incarnation. Card:
 //   { id, text, title, status, sid?, stored?, err?, ts, doneAt?,
 //     target?, targetTitle?, projectName? }
 //   status: queued | launching | running | review-wait | done | failed
@@ -174,7 +176,10 @@ function persist() {
     persistTimer = null
     try {
       if (engineCtx && engineCtx.storage) {
-        await engineCtx.storage.set(STORE_KEY, { v: 3, cards: state.cards, playing: false })
+        // `playing` is intentionally persisted as false (restart-safe): no
+        // fresh process ever auto-launches cards. The hydrate diagnostics
+        // (v4) ride along so the next incarnation can count re-imports.
+        await engineCtx.storage.set(STORE_KEY, { v: 4, cards: state.cards, playing: false, hydrate: state.hydrateInfo || null })
       }
     } catch { /* storage blip — retried on the next transition */ }
   }, 400)
@@ -524,9 +529,15 @@ function waitForModelFree() {
 // ── C1: card targets (new session OR an existing session) ──────────────────
 // session.list (same RPC the sidebar uses) → rows {id, title, preview,
 // started_at, message_count}. "With a reply" = message_count >= 2.
+// ORDER CONTRACT (bug, 2026-10-14): the gateway already returns rows in
+// last-ACTIVITY order, but the row summary exposes no activity field — so we
+// must NOT re-sort client-side. The old started_at (creation-time) sort demoted
+// old-but-active sessions out of the visible top PICKER_SHOW: an actively
+// running week-old session vanished from the dropdown entirely (Arthur had to
+// paste the ID by hand). Preserve the gateway's order through filter + slice.
 let sessionCache = { at: 0, list: [] }
 const SESSION_LIST_REFRESH_MS = 30000
-const SESSION_LIST_LIMIT = 30 // over-fetch; the picker shows the latest 10
+const SESSION_LIST_LIMIT = 30 // over-fetch; the picker shows the latest 10 (by last activity)
 const PICKER_SHOW = 10
 
 async function refreshSessionList(force) {
@@ -537,10 +548,10 @@ async function refreshSessionList(force) {
   try {
     const res = await host.request('session.list', { limit: SESSION_LIST_LIMIT })
     const rows = (res && res.sessions) || []
+    // NO client-side sort — gateway order IS last-activity order (see above).
     const list = rows
       .filter((r) => (r.message_count || 0) >= 2)
-      .map((r) => ({ id: r.id, title: (r.title || '').trim() || r.id, last: r.started_at || 0 }))
-      .sort((a, b) => b.last - a.last)
+      .map((r) => ({ id: r.id, title: (r.title || '').trim() || r.id }))
     sessionCache = { at: now, list }
   } catch {
     /* keep the stale cache (or empty) — fail-open */
@@ -1120,7 +1131,9 @@ function waitReview(id) {
 // ── user actions ────────────────────────────────────────────────────────────
 function play() {
   if (!state.playing) {
-    set({ playing: true })
+    // resumeHint (set by hydrate after a reload with pending work) is cleared
+    // the moment the user takes back control.
+    set({ playing: true, resumeHint: null })
     setTimeout(pump, 100)
   }
 }
@@ -1270,15 +1283,30 @@ async function hydrate() {
     const s = await engineCtx.storage.get(STORE_KEY)
     if (s && Array.isArray(s.cards)) {
       const busy = (host.state.busyBySession.get() || {})
+      let requeued = 0
       const cards = s.cards.map((c) => {
         if (c.status === 'launching' || c.status === 'running') {
           if (c.sid && busy[c.sid]) return { ...c, status: 'running', err: 're-attached after restart' }
           if (c.sid && c.stored) return { ...c, status: 'review-wait', err: 're-attached after restart' }
+          requeued += 1
           return { ...c, status: 'queued', err: 'interrupted before completion — re-queued' }
         }
         return c
       })
-      set({ cards, playing: false, hydrated: true })
+      // Re-import observability (v4): every module incarnation counts itself.
+      // `playing` is forced false by design (restart-safe), so without this a
+      // reload looked like an idle queue with orphaned cards — the incident
+      // that motivated it. resumeHint makes the state visible in the UI; the
+      // stored diagnostics make the next occurrence diagnosable.
+      const inFlight = cards.filter((c) => ['running', 'review-wait'].includes(c.status)).length
+      const queuedN = cards.filter((c) => c.status === 'queued').length
+      const prevInfo = (s && s.hydrate) || null
+      const info = { n: (prevInfo ? prevInfo.n : 0) + 1, at: Date.now(), inFlight, requeued }
+      if (queuedN + inFlight > 0) {
+        console.info('[prompt-queue] hydrate #' + info.n + ' — restored ' + cards.length + ' cards ('
+          + queuedN + ' queued, ' + inFlight + ' re-attached, ' + requeued + ' re-queued); playing forced false by design — press Play to resume')
+      }
+      set({ cards, playing: false, hydrated: true, hydrateInfo: info, resumeHint: queuedN + inFlight > 0 ? info : null })
       // resume re-attached cards through the same wait machinery (per-card
       // timers, so no clash with a later Play)
       cards.forEach((c) => {
@@ -1757,6 +1785,7 @@ function TargetPicker({ value, trigger, onSelect }) {
               style: { ...rowStyle, color: committed && value === s.id ? 'var(--ui-accent)' : 'var(--ui-text-secondary)', fontWeight: committed && value === s.id ? 600 : 400 },
               children: [s.title],
             })),
+        jsx('div', { style: noteStyle, children: 'Most recently active sessions (top ' + PICKER_SHOW + '). Hidden/internal ones are excluded — paste any ID below.' }),
         jsxs('div', { style: { display: 'flex', gap: '4px', padding: '6px 7px', borderTop: '1px solid var(--ui-stroke-secondary)' }, children: [
           jsx('input', { value: manual, onChange: (e) => { setManual(e.target.value); setManualErr('') }, placeholder: '\u2026or paste a session ID', style: { ...inputBase, flex: 1, minWidth: 0, borderColor: manualErr ? 'var(--ui-text-secondary)' : undefined } }),
           jsx('button', { type: 'button', onClick: () => { const idm = manual.trim(); if (!/^\d{8}_\d{6}_[0-9a-f]{6}$/i.test(idm)) { setManualErr('expected YYYYMMDD_HHMMSS_hex6'); return } pick(idm, idm) }, style: { border: '1px solid var(--ui-stroke-secondary)', background: 'transparent', color: 'var(--ui-text-secondary)', fontSize: '0.65rem', borderRadius: '4px', padding: '3px 7px', cursor: 'pointer' }, children: 'Set' }),
@@ -2006,10 +2035,12 @@ function Board() {
           jsx(IngestMenu, {}),
           jsx(SettingsMenu, {}),
           jsx('span', {
-            style: { fontSize: '0.65rem', color: q.playing && q.modelBusy ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)', marginLeft: 'auto' },
+            style: { fontSize: '0.65rem', color: (q.playing && q.modelBusy) || q.resumeHint ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)', marginLeft: 'auto' },
             children: q.playing && q.modelBusy
               ? '⏳ waiting for model…'
-              : `${counts.queued} queued · ${counts.done} done${counts.failed ? ` · ${counts.failed} failed` : ''}`,
+              : q.resumeHint
+                ? '⏸ restored after reload — press Play to resume'
+                : `${counts.queued} queued · ${counts.done} done${counts.failed ? ` · ${counts.failed} failed` : ''}`,
           }),
         ],
       }),
@@ -2168,11 +2199,17 @@ function Chip() {
   const queued = q.cards.filter((c) => c.status === 'queued').length
   let label
   let color
+  const restored = !q.playing && q.resumeHint && (queued + active > 0)
   if (q.playing && q.modelBusy) {
     label = 'queue · waiting for model'
     color = 'var(--ui-accent)'
   } else if (q.playing) {
     label = `queue · ${active || 0} active, ${queued} next`
+    color = 'var(--ui-accent)'
+  } else if (restored) {
+    // A reload re-imported the module while work was pending. Distinct from
+    // "paused" on purpose — this one happened TO the user, not by their click.
+    label = `queue restored · ${queued + active} pending — press Play`
     color = 'var(--ui-accent)'
   } else if (queued) {
     label = `queue paused · ${queued} waiting`
@@ -2186,9 +2223,11 @@ function Chip() {
       ? 'A session is still using the model (your follow-ups, other surfaces, or a card\'s sub-agents). The queue holds the next prompt until it — and any background review — is fully done.'
       : q.playing
         ? 'Prompt queue is draining: each card becomes a new session, strictly one at a time, gated on every session finishing + background-review completion.'
-        : queued
-          ? 'Prompt queue is paused. Press Play on the board (bottom-left) to resume.'
-          : 'Prompt queue: add prompts on the board (bottom-left). Play drains them one by one into new sessions.',
+        : restored
+          ? 'The app (or the plugin) reloaded while the queue had pending work — Play state never survives a reload by design. Press Play on the board (bottom-left) to resume; in-flight cards were re-attached or re-queued (see their card notes).'
+          : queued
+            ? 'Prompt queue is paused. Press Play on the board (bottom-left) to resume.'
+            : 'Prompt queue: add prompts on the board (bottom-left). Play drains them one by one into new sessions.',
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '5px', height: '100%', padding: '0 6px', fontSize: '0.6875rem', color, whiteSpace: 'nowrap' },
       children: [

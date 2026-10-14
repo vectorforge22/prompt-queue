@@ -3,6 +3,34 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.4.2 (2026-10-14 — reload visibility + session picker ordering)
+
+Two bug fixes found while running the queue against live sessions:
+
+- **A reload no longer masquerades as an idle queue.** `playing` is volatile
+  by design (a fresh process must never auto-launch cards), but the reset was
+  invisible: the button flipped back to Play while pending cards sat with no
+  signal, looking like the queue had quietly died. Hydrate now counts every
+  module incarnation as stored v4 diagnostics (`hydrate: {n, at, inFlight,
+  requeued}`), logs a console line, and sets a **resume hint** — the statusbar
+  chip reads "queue restored · N pending — press Play" (accent-colored,
+  distinct from user-paused) and the board header shows "restored after
+  reload" next to the Play button until Play is pressed.
+- **The session picker preserves the gateway's last-activity order.** It used
+  to re-sort `session.list` rows by `started_at` (creation time) before
+  slicing the top 10 — which demoted old-but-active sessions out of the
+  dropdown entirely (an actively running week-old session vanished; pasting
+  the ID by hand was the only way in). The gateway already returns rows in
+  last-activity order but exposes no activity field, so the client-side sort
+  is gone and its order is preserved through filter + slice. The menu now
+  notes that hidden/internal sessions are excluded and that any ID can be
+  pasted.
+
+Verification: v1.4.2 regression suite 15/15 in the VM sandbox (picker order
+contract A1–A4; reload observability B1–B11, including a two-incarnation
+re-import simulation and full drain-through-failure with no hang), ESM syntax
+check passed.
+
 ## 1.4.1 (2026-10-11 — two-row composer target picker)
 
 The single "🎯 target ▾" drop-down above the composer became **two stacked
