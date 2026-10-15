@@ -16,6 +16,23 @@ Built for feeding a local-model setup a list of prompts one at a time —
 without the next prompt fighting the background review for the inference slot
 — while keeping every created session visible in the normal sidebar.
 
+## Who is this plugin for?
+
+For people running **local models on scarce compute**: one inference slot,
+**max parallelism = 1**. Every request — your prompts, the agent's background
+self-improvement reviews, context compaction — serializes through the same
+server, and firing two at once means they race (or steer each other) instead
+of just waiting.
+
+Prompt Queue is designed around exactly that constraint. You queue prompts as
+cards; **▶ Play** releases them one at a time, and each one is only sent once
+the model slot is **provably free** — no session working, any background
+review fully complete, and context compaction committed. Your queued work
+lines up *behind* the model's own maintenance tasks instead of racing them.
+
+(On a cloud API where parallel requests are cheap you probably don't need the
+gating — though batching prompts one-at-a-time is still handy.)
+
 ## What it adds
 
 - **Pane** — docked below the session list (bottom-left of the default layout);
@@ -33,7 +50,15 @@ without the next prompt fighting the background review for the inference slot
   `thread=bg-review` log markers, 30 s spawn grace, 20 s poll, **fail-closed
   on log errors**: the queue holds with a visible `⏸ holding — review
   verification unavailable` state and retries until absence is confirmed;
-  fail-open is an explicit opt-in in the gear).
+  fail-open is an explicit opt-in in the gear). Orphaned spawn markers (the
+  gateway died mid-review → no terminal line ever) release the lane after
+  3 h instead of failing the card.
+- **Compaction gate** — context compaction holds the same slot via its aux
+  model call. Mid-turn runs are covered by the global session gate (the
+  session reads `working`); the idle-resume compaction path is not, so a
+  fresh (<60 min) compression start marker with no terminal line in
+  `agent.log` also holds the lane (`⏳ waiting for compaction…`). Orphaned
+  markers release — a dead run can't wedge the queue forever.
 - **Slot hygiene** — after a card's turn, its one-shot session's
   active-session slot is released (`session.close`; the sidebar row stays), so a
   long queue can't exhaust the session cap.

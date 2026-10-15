@@ -2353,6 +2353,16 @@ function EnqueueChip({ prompt, dedupeKey, streaming }) {
   return jsx('span', { style, children: '::enqueue — prompt missing or too long (max 2000 chars)' })
 }
 
+// Test-only exports (smoke/regression suite — test-plugin.mjs). Leading-underscore
+// names; not part of the plugin contract, never touched by the UI.
+export const __test = {
+  reviewCleared,
+  freshCompaction,
+  refreshSessionList,
+  hydrate,
+  getState: () => state,
+}
+
 export default {
   id: 'prompt-queue',
   name: 'Prompt Queue',
