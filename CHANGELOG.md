@@ -3,6 +3,41 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.4.4 (2026-10-15 — compaction joins the "wait until done" gate)
+
+Question from the field (2026-10-15): a queued prompt was sent while the
+bg-review-watch chip still claimed "compacting". The badge turned out to be
+stale (see bg-review-watch 0.4.1), but the question exposed a real gap: **the
+queue's gate never looked at compaction at all.** It gated on `session.active_list`
++ background reviews only.
+
+That was safe for MID-turn compaction — it suspends the turn, so the session
+reads `working` and gate 1 holds. But `agent/conversation_compression.py` also
+has an idle-resume path ("Resumed after Xs idle — compacting … before
+continuing") that runs while the session reads IDLE: gate 1 misses it, and a
+prompt submitted then would race the aux model call for the single inference
+slot.
+
+This release adds gate 3 (`freshCompaction()`):
+
+- A **fresh** (<60 min) compression start marker with no terminal line
+  (done/telemetry) in `agent.log` now holds the lane, same evidence style as
+  the review gate. 60 min leaves wide headroom over measured runs (~5 and
+  ~8 min on this box).
+- Orphan markers (gateway/process died mid-run → no terminal line ever) do
+  NOT hold the lane — the v1.4.3 lesson, applied to compaction.
+- Log-read errors follow `settings.gateFailOpen` (default: fail closed +
+  visible), matching the review gate.
+- UI: while holding on a compaction the board header shows "⏳ waiting for
+  compaction…" and the status chip reads "queue · waiting for compaction"
+  with a dedicated tooltip — distinguishable from the ordinary model-busy
+  hold.
+
+Verification: `node --check` pass; gate verdict re-run against the live
+agent.log (freshCompaction → inactive after the 10-15 19:32→19:40 run, as it
+should be) and against synthesized fresh-orphan / healthy / over-budget
+markers.
+
 ## 1.4.3 (2026-10-15 — review gate releases lanes on orphaned spawn markers)
 
 The review gate's "running ⇔ latest spawn > latest completion" rule assumed

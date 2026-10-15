@@ -13,16 +13,22 @@
 // EXISTING conversation and are never closed by the plugin. Bot mode feeds
 // a profile's canonical hidden "Bot Chat" (name-as-identity — see below).
 //
-// TWO independent gates protect the single local-model slot:
+// THREE independent gates protect the single local-model slot:
 //   1. Global session gate — session.active_list (authoritative,
 //      process-wide): holds while ANY live session is working/starting/
 //      queued — user follow-ups in other sessions, other surfaces, or a
 //      card's own sub-agents. (The v1 per-card busyBySession wait only
 //      saw sessions the renderer tracked; a follow-up slipped past it.)
+//      Mid-turn compaction also reads as 'working' here (it suspends the
+//      turn), so it is covered transitively by this gate.
 //   2. Per-card review gate — background reviews run on a thread, NOT a
 //      TUI session, so they never appear in active_list. Log-marker
 //      detection (below) + 30 s spawn grace covers the turn→review fork
 //      delay.
+//   3. Compaction gate (v1.4.4) — the idle-resume compaction path runs
+//      while its session reads IDLE in active_list, so gate 1 misses it;
+//      a fresh (<60 min) compression start marker with no terminal line
+//      holds the lane instead (freshCompaction, below).
 //
 // Renderer-only disk plugin (loaded uncompiled): only @hermes/plugin-sdk /
 // react / react/jsx-runtime resolve. UI is written with jsx() calls.
@@ -162,7 +168,7 @@ function errMsg(e) {
 }
 
 // ── module-scoped store (survives pane remounts + hot reload) ───────────────
-let state = { cards: [], playing: false, hydrated: false, modelBusy: false }
+let state = { cards: [], playing: false, hydrated: false, modelBusy: false, modelBusyReason: null }
 const subs = new Set()
 let persistTimer = null
 let engineCtx = null
@@ -504,6 +510,51 @@ async function anySessionWorking() {
   }
 }
 
+// Compaction slot awareness (v1.4.4). Context compression does not always show as
+// 'working' in session.active_list: the idle-resume path ("Resumed after Xs idle —
+// compacting … before continuing", agent/conversation_compression.py) fires while
+// the session reads idle, and it holds the same single inference slot via the aux
+// model call. So a FRESH compression start marker with no terminal line
+// (done/telemetry) also holds the lane. Orphan markers (gateway/process died
+// mid-run → no terminal line ever appears) must NOT hold forever — same lesson as
+// the review gate (v1.4.3). Measured runs on this box: ~5 min and ~8 min; the
+// 60-min ceiling leaves wide headroom over anything healthy.
+const RE_COMP_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression started: session=(\S+)/
+const RE_COMP_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression done: session=(\S+)/
+const RE_COMP_TEL = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*context compression attempt telemetry/
+const COMP_STALE_MS = 60 * 60 * 1000
+function compLineTs(text) {
+  // agent.log timestamps are local time (same convention the log writer uses).
+  const m = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+/.exec(text)
+  if (!m) return null
+  const t = new Date(m[1].replace(' ', 'T').replace(',', '.')).getTime()
+  return isNaN(t) ? null : t
+}
+// { active: bool } — true while a fresh (non-orphan) compaction is in flight.
+// Read errors follow settings.gateFailOpen (default false = fail closed + visible):
+// a log-read failure during a real compaction must not release the lane.
+async function freshCompaction() {
+  try {
+    const c = await host.logs({ file: 'agent', lines: 3000, search: 'context compression' })
+    const lines = (c && (c.lines || c.data || c.logs)) || []
+    let start = null
+    let end = null
+    for (const text of lines) {
+      let m = RE_COMP_DONE.exec(text)
+      if (m) { const t = compLineTs(text); if (t != null && (end == null || t > end)) end = t; continue }
+      m = RE_COMP_TEL.exec(text)
+      if (m) { const t = compLineTs(text); if (t != null && (end == null || t > end)) end = t; continue }
+      m = RE_COMP_START.exec(text)
+      if (m) { const t = compLineTs(text); if (t != null && (start == null || t > start)) start = t }
+    }
+    if (start == null) return { active: false }
+    const running = end == null || start > end
+    return { active: running && Date.now() - start < COMP_STALE_MS }
+  } catch {
+    return { active: !settings.gateFailOpen }
+  }
+}
+
 // Resolves 'free' after two consecutive clear readings (kills single-blip
 // false-clears), 'paused' if the queue stops playing while waiting.
 function waitForModelFree() {
@@ -513,13 +564,20 @@ function waitForModelFree() {
     let interval = null
     const check = async () => {
       if (stopped) return
-      const busy = await anySessionWorking()
+      let busy = await anySessionWorking()
+      let reason = null
+      if (!busy) {
+        // Mid-turn compaction already shows as 'working' above; this catches the
+        // idle-resume path where the session reads idle while the slot is held.
+        const comp = await freshCompaction()
+        if (comp.active) { busy = true; reason = 'compaction' }
+      }
       if (stopped) return
-      set({ modelBusy: busy })
+      set({ modelBusy: busy, modelBusyReason: reason })
       if (!state.playing) {
         stopped = true
         if (interval) clearInterval(interval)
-        set({ modelBusy: false })
+        set({ modelBusy: false, modelBusyReason: null })
         resolve('paused')
         return
       }
@@ -527,7 +585,7 @@ function waitForModelFree() {
       else if (++clearStreak >= 2) {
         stopped = true
         if (interval) clearInterval(interval)
-        set({ modelBusy: false })
+        set({ modelBusy: false, modelBusyReason: null })
         resolve('free')
       }
     }
@@ -2048,7 +2106,7 @@ function Board() {
           jsx('span', {
             style: { fontSize: '0.65rem', color: (q.playing && q.modelBusy) || q.resumeHint ? 'var(--ui-accent)' : 'var(--ui-text-quaternary)', marginLeft: 'auto' },
             children: q.playing && q.modelBusy
-              ? '⏳ waiting for model…'
+              ? (q.modelBusyReason === 'compaction' ? '⏳ waiting for compaction…' : '⏳ waiting for model…')
               : q.resumeHint
                 ? '⏸ restored after reload — press Play to resume'
                 : `${counts.queued} queued · ${counts.done} done${counts.failed ? ` · ${counts.failed} failed` : ''}`,
@@ -2212,7 +2270,7 @@ function Chip() {
   let color
   const restored = !q.playing && q.resumeHint && (queued + active > 0)
   if (q.playing && q.modelBusy) {
-    label = 'queue · waiting for model'
+    label = q.modelBusyReason === 'compaction' ? 'queue · waiting for compaction' : 'queue · waiting for model'
     color = 'var(--ui-accent)'
   } else if (q.playing) {
     label = `queue · ${active || 0} active, ${queued} next`
@@ -2231,7 +2289,9 @@ function Chip() {
   }
   return jsxs(Tip, {
     label: q.playing && q.modelBusy
-      ? 'A session is still using the model (your follow-ups, other surfaces, or a card\'s sub-agents). The queue holds the next prompt until it — and any background review — is fully done.'
+      ? (q.modelBusyReason === 'compaction'
+        ? 'Context compression is holding the model slot (a session is summarizing its own middle — ~4–8 min on this box). The queue holds the next prompt until it commits — plus any background review.'
+        : 'A session is still using the model (your follow-ups, other surfaces, or a card\'s sub-agents). The queue holds the next prompt until it — and any background review — is fully done.')
       : q.playing
         ? 'Prompt queue is draining: each card becomes a new session, strictly one at a time, gated on every session finishing + background-review completion.'
         : restored
