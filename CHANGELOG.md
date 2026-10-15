@@ -3,6 +3,37 @@
 Behavioral history for the `prompt-queue` desktop plugin, oldest feature-set
 first. Dates are release dates on this repo's history.
 
+## 1.4.3 (2026-10-15 — review gate releases lanes on orphaned spawn markers)
+
+The review gate's "running ⇔ latest spawn > latest completion" rule assumed
+every background-review spawn eventually logs a terminal line. It does not:
+the review is a THREAD inside the gateway process, so a PC reboot or kill
+mid-review dies without logging anything — and the lane then holds (and
+eventually FAILS) cards on a marker for a process that no longer exists.
+Observed 2026-10-14: review spawned 19:34, PC rebooted 19:47; every queued
+card after that would have held the lane 3h and failed with "a review is
+STILL running".
+
+- **`reviewCleared()` now treats an orphaned spawn as cleared.** A spawn
+  marker older than `REVIEW_STALL_MS` (3h — longest observed healthy review:
+  ~2h) with no terminal line releases the lane immediately instead of waiting
+  out the backstop. This is the same semantics bg-review-watch v0.4.0 shows
+  as "review stale". Cards mid-wait when a marker orphans are released on the
+  next 20s poll (typically within 3h of the orphan, and immediately if the
+  orphan already exists).
+- **The backstop still exists, and now means something precise.** It fires
+  only while a FRESH (<3h) active marker persists across a full 3h hold —
+  i.e. a review thread hung inside a LIVE gateway process — and the failure
+  message says so (`held the lane for 3h while a fresh (<3h) review marker
+  stayed active — likely a hung review in a live gateway`).
+- No behavior change for healthy reviews: anything younger than 3h gates
+  exactly as before, fail-closed on log errors per `gateFailOpen`.
+
+Verification: ESM syntax check passed; gate decision re-verified against the
+live `agent.log` orphan (spawn 2026-10-14 19:34, no terminal line) — old
+logic: `active`, new logic: `cleared`; a fresh synthetic spawn (<3h) still
+gates `active` under the new logic.
+
 ## 1.4.2 (2026-10-14 — reload visibility + session picker ordering)
 
 Two bug fixes found while running the queue against live sessions:

@@ -71,14 +71,18 @@ const TURN_FALLBACK_POLL_MS = 10000
 // poll, so this only trips on genuinely hung sessions.
 const TURN_STALL_MS = 12 * 60 * 60 * 1000
 const REVIEW_SPAWN_GRACE_MS = 30000 // reviews fork AFTER the turn ends; wait this long before accepting "none spawned"
-// Last-resort review-gate backstop: a card may sit in 'review-wait' at most
-// this long. The 20s log poll is the real detector; this only fires when the
-// in-memory poll timer was lost (pane unmount/hot-reload) and the card would
-// otherwise hold the lane forever with the review long finished. On fire it
-// re-checks the log: a CONFIRMED-absent review releases the card; a still-
-// running review fails the card with a retry hint instead of hanging.
-// 3h >> any observed review (longest ~2h) and matches the TURN_STALL_MS
-// order of magnitude.
+// Review-gate backstop AND orphan-spawn ceiling (two roles, one constant):
+// (1) waitReview: a card may sit in 'review-wait' at most this long before it
+// fails with a retry hint — the last-resort tripwire when the in-memory poll
+// timer was lost and the 20s log poll can't see a fresh spawn.
+// (2) reviewCleared: a bg-review SPAWN MARKER older than this with no terminal
+// line is an ORPHAN, not an active review — the thread lives inside the gateway
+// process, so a reboot/kill/OOM mid-review dies without logging anything and
+// start>done would pin "running" forever (observed 2026-10-14: spawn 19:34,
+// reboot 19:47). Such a marker releases the lane instead of holding/failing
+// cards on a dead process. bg-review-watch v0.4.0 shows the same condition as
+// "review stale". 3h >> any observed review (longest ~2h) and matches the
+// TURN_STALL_MS order of magnitude.
 const REVIEW_STALL_MS = 3 * 60 * 60 * 1000
 const CLOSE_AFTER_DONE_MS = 3000
 const SUBMIT_RETRIES = 3
@@ -465,14 +469,20 @@ async function reviewState() {
   return { spawn, done }
 }
 
-// Gate verdict: true = no review running, false = review running,
-// 'error' = could NOT verify (host.logs failed). The caller decides what
-// 'error' means via settings.gateFailOpen (default: fail closed + visible).
+// Gate verdict: true = no review running (or only an orphaned marker — slot
+// is free), false = a live review is running, 'error' = could NOT verify
+// (host.logs failed). The caller decides what 'error' means via
+// settings.gateFailOpen (default: fail closed + visible).
 async function reviewCleared() {
   try {
     const r = await reviewState()
     const active = r.spawn != null && (r.done == null || r.spawn > r.done)
-    return !active
+    if (!active) return true
+    // Orphaned spawn: no healthy review runs longer than REVIEW_STALL_MS, so a
+    // marker that old with no terminal line belongs to a dead process (gateway
+    // reboot/kill/OOM mid-review). Release the lane instead of holding cards —
+    // or failing them after a 3h wait — on a review that cannot finish.
+    return Date.now() - r.spawn > REVIEW_STALL_MS
   } catch {
     return 'error'
   }
@@ -1111,14 +1121,15 @@ function waitReview(id) {
         if (!c.holdingReview) patchCard(id, { holdingReview: true })
         return
       }
-      // verdict === false: a review is still running — keep waiting, unless
-      // we've been here past the backstop, in which case the review itself is
-      // the anomaly (no review has ever run this long): fail with a hint
+      // verdict === false after this long: the log still shows an ACTIVE marker
+      // that is FRESH (younger than REVIEW_STALL_MS — orphans now release the
+      // lane in reviewCleared). A fresh-but-ancient-hold usually means the
+      // review thread is hung inside a LIVE gateway process: fail with a hint
       // instead of holding the lane forever.
       if (Date.now() - startedAt > REVIEW_STALL_MS) {
         patchCard(id, {
           status: 'failed', holdingReview: false, reviewWaitSince: null,
-          err: `review gate: a review is STILL running after ${Math.round(REVIEW_STALL_MS / 3600000)}h (none has ever run that long) — check the session, then retry`,
+          err: `review gate: held the lane for ${Math.round(REVIEW_STALL_MS / 3600000)}h while a fresh (<3h) review marker stayed active — likely a hung review in a live gateway; check agent.log 'bg-review', then retry`,
           ts: Date.now(),
         })
         return finish()
